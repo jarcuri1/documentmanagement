@@ -97,7 +97,15 @@ CONFIG = {
 
 _EMAIL_TOKEN = r"[^@\s]+@[^@\s]+\.[^@\s]+"
 _EMAIL_RE = re.compile(rf"^{_EMAIL_TOKEN}$")
-_REQUIRED_JOB_FIELDS = ["property", "tenant_name", "tenant_email", "pdf_path", "signing_name"]
+_REQUIRED_JOB_FIELDS = ["property", "pdf_path", "signing_name"]
+
+
+def _signers_of(job: dict) -> list:
+    if job.get("signers"):
+        return job["signers"]
+    if job.get("tenant_name") and job.get("tenant_email"):
+        return [{"name": job["tenant_name"], "email": job["tenant_email"]}]
+    return []
 
 
 # ======================================================================
@@ -172,8 +180,14 @@ def validate_job(job_path: Path):
     missing = [k for k in _REQUIRED_JOB_FIELDS if not job.get(k)]
     if missing:
         return None, f"missing fields: {missing}"
-    if not _EMAIL_RE.match(str(job["tenant_email"])):
-        return None, f"tenant_email looks malformed: {job['tenant_email']!r}"
+    signers = _signers_of(job)
+    if not signers:
+        return None, "job has no signers (need signers[] or tenant_name/tenant_email)"
+    for i, s in enumerate(signers, 1):
+        if not s.get("name") or not s.get("email"):
+            return None, f"signer {i} missing name/email: {s!r}"
+        if not _EMAIL_RE.match(str(s["email"])):
+            return None, f"signer {i} email looks malformed: {s['email']!r}"
     if not Path(job["pdf_path"]).exists():
         return None, f"lease PDF not found: {job['pdf_path']}"
     return job, ""

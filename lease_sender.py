@@ -208,14 +208,30 @@ def step(auditor: Auditor, label: str, fn):
             raise StepFailure(f"Step failed: {label} — {e}") from e
 
 
+def signers_of(job: dict) -> list:
+    """The lease's signers. Supports the multi-signer contract and the legacy
+    single-tenant shape so older job files still work."""
+    if job.get("signers"):
+        return job["signers"]
+    if job.get("tenant_name") and job.get("tenant_email"):
+        return [{"name": job["tenant_name"], "email": job["tenant_email"]}]
+    return []
+
+
 def load_job(path: Path) -> dict:
     job = json.loads(path.read_text(encoding="utf-8"))
-    required = ["property", "tenant_name", "tenant_email", "pdf_path", "signing_name"]
+    required = ["property", "pdf_path", "signing_name"]
     missing = [k for k in required if not job.get(k)]
     if missing:
         raise ValueError(f"Job file missing fields: {missing}")
-    if not re.match(rf"^{_EMAIL_TOKEN}$", job["tenant_email"]):
-        raise ValueError(f"Tenant email looks malformed: {job['tenant_email']}")
+    signers = signers_of(job)
+    if not signers:
+        raise ValueError("Job file has no signers (need signers[] or tenant_name/tenant_email)")
+    for i, s in enumerate(signers, 1):
+        if not s.get("name") or not s.get("email"):
+            raise ValueError(f"Signer {i} missing name/email: {s!r}")
+        if not re.match(rf"^{_EMAIL_TOKEN}$", s["email"]):
+            raise ValueError(f"Signer {i} email looks malformed: {s['email']}")
     if not Path(job["pdf_path"]).exists():
         raise ValueError(f"Lease PDF not found: {job['pdf_path']}")
     return job
@@ -262,37 +278,39 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         page.click(S["apply_template_btn"], timeout=t)
     step(auditor, "apply lease template", apply_template)
 
-    # 6. Add tenant as participant
-    def add_tenant():
+    # 6. Add each signer as a participant (one or two tenants)
+    def add_signers():
         page.click(S["signers_btn"], timeout=t)
-        page.click(S["add_participant_btn"], timeout=t)
-        page.click(S["add_new_contact"], timeout=t)
-        page.fill(S["participant_name"], job["tenant_name"], timeout=t)
-        page.fill(S["participant_email"], job["tenant_email"], timeout=t)
-        # role select is optional depending on template roles; ignore if absent
-        if page.locator(S["participant_role"]).count():
-            page.select_option(S["participant_role"], label="Tenant")
-        page.click(S["participant_save"], timeout=t)
-    step(auditor, "add tenant participant", add_tenant)
+        for s in signers_of(job):
+            page.click(S["add_participant_btn"], timeout=t)
+            page.click(S["add_new_contact"], timeout=t)
+            page.fill(S["participant_name"], s["name"], timeout=t)
+            page.fill(S["participant_email"], s["email"], timeout=t)
+            # role select is optional depending on template roles; ignore if absent
+            if page.locator(S["participant_role"]).count():
+                page.select_option(S["participant_role"], label="Tenant")
+            page.click(S["participant_save"], timeout=t)
+    step(auditor, "add tenant participants", add_signers)
 
-    # 7. HARD CHECK — on-screen email must equal approved email exactly
+    # 7. HARD CHECK — every approved signer email must appear on-screen exactly
     #    (normalized, case-insensitive) and no OTHER email may appear.
-    def verify_recipient():
+    def verify_recipients():
         container = page.locator(S["review_email_text"])
         container.wait_for(timeout=t)
         text = container.inner_text()
-        approved = job["tenant_email"].strip().lower()
+        approved = {s["email"].strip().lower() for s in signers_of(job)}
         # Exact token match, not a substring test: 'jsmith@x.com' must not be
         # accepted because it is a substring of 'xjsmith@x.com'.
         tokens = {tok.lower() for tok in re.findall(_EMAIL_SCRAPE, text)}
-        assert approved in tokens, (
-            f"Approved email {approved!r} not found as an exact recipient on "
-            f"the review screen. Emails on screen: {sorted(tokens)!r}"
+        missing = approved - tokens
+        assert not missing, (
+            f"Approved signer email(s) {sorted(missing)!r} not found on the "
+            f"review screen. Emails on screen: {sorted(tokens)!r}"
         )
         whitelist = {e.strip().lower() for e in CONFIG["signer_whitelist"]}
-        unexpected = tokens - {approved} - whitelist
+        unexpected = tokens - approved - whitelist
         assert not unexpected, f"Unexpected emails on review screen: {sorted(unexpected)!r}"
-    step(auditor, "verify recipient matches approval", verify_recipient)
+    step(auditor, "verify recipients match approval", verify_recipients)
 
     # 8. SEND — only reachable if every check above passed.
     #    We flip state['sent_clicked'] the instant the click lands so the
@@ -310,7 +328,8 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
 def process_job(job_path: Path):
     job = load_job(job_path)
     name = job_path.stem
-    notify("info", f"Starting signing for {job['property']} -> {job['tenant_email']}", name)
+    recipients = ", ".join(s["email"] for s in signers_of(job))
+    notify("info", f"Starting signing for {job['property']} -> {recipients}", name)
 
     state = {"sent_clicked": False}
     with sync_playwright() as p:
@@ -332,10 +351,10 @@ def process_job(job_path: Path):
                 # flag it -- NEVER move it back to a pickable state, NEVER
                 # auto-resend. Exit 2 so the watcher surfaces it.
                 notify("error",
-                       f"AMBIGUOUS: Send was clicked for {job['property']} but "
-                       f"confirmation was not observed ({e}). Job LEFT in Sending — "
-                       f"verify in Authentisign before any resend. Audit: {auditor.dir}",
-                       name)
+                       f"AMBIGUOUS: Send was clicked for {job['property']} "
+                       f"({recipients}) but confirmation was not observed ({e}). Job "
+                       f"LEFT in Sending — verify in Authentisign before any resend. "
+                       f"Audit: {auditor.dir}", name)
                 sys.exit(2)
             # Clean pre-send abort: nothing was sent, safe to file to Failed.
             notify("error", f"ABORTED before send — {e}. Screenshots in {auditor.dir}", name)
@@ -354,14 +373,15 @@ def process_job(job_path: Path):
         shutil.move(str(job_path), sent / job_path.name)
     except Exception as e:
         notify("error",
-               f"Lease for {job['property']} WAS SENT to {job['tenant_email']} but "
-               f"filing to Sent failed ({e}). Job left in Sending — file it manually, "
-               f"do NOT resend. Audit: {auditor.dir}", name)
+               f"Lease for {job['property']} WAS SENT to {recipients} but filing to "
+               f"Sent failed ({e}). Job left in Sending — file it manually, do NOT "
+               f"resend. Audit: {auditor.dir}", name)
         sys.exit(3)
 
+    signer_list = ", ".join(f"{s['name']} <{s['email']}>" for s in signers_of(job))
     notify("success",
-           f"Lease for {job['property']} sent to {job['tenant_name']} "
-           f"<{job['tenant_email']}>. Audit: {auditor.dir}", name)
+           f"Lease for {job['property']} sent to {signer_list}. "
+           f"Audit: {auditor.dir}", name)
 
 
 def setup_profile():
