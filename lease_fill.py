@@ -360,6 +360,16 @@ def _fmt_date(v):
     return str(v)
 
 
+def _iso_date(v):
+    """YYYY-MM-DD for the filing filename, or '' if the format is unknown."""
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(str(v), fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return ""
+
+
 def normalize_intake(raw):
     if not isinstance(raw, dict):
         raise LeaseFillError("intake is not a JSON object")
@@ -391,6 +401,13 @@ def normalize_intake(raw):
         "utilities": raw.get("utilities", {}),
         "pets": raw.get("pets", []),
         "tenants": tenants,
+        # Filing metadata (used by lease_filer when the signed lease returns).
+        # property_key/unit should match lease_folders.json; optional but
+        # recommended for clean filing — otherwise slugify(property) is used.
+        "property_key": raw.get("property_key", ""),
+        "unit": raw.get("unit", ""),
+        "filing_address": raw.get("filing_address", ""),
+        "term_start_iso": _iso_date(raw["term_start"]),
     }
 
 
@@ -414,6 +431,11 @@ def build_job(data, pdf_path):
         "tenant_name": signers[0]["name"],    # legacy single-signer mirror
         "tenant_email": signers[0]["email"],
         "pdf_path": str(pdf_path),
+        # Filing metadata for lease_filer (the signed-lease return trip).
+        "property_key": data.get("property_key") or _slug(data["property"]),
+        "unit": data.get("unit", ""),
+        "filing_address": data.get("filing_address") or data["property"].split(",")[0].strip(),
+        "term_start_iso": data.get("term_start_iso", ""),
     }
 
 
