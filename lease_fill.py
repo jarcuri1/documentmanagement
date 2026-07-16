@@ -59,9 +59,11 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
-from datetime import date, datetime
+import time
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import docx
@@ -100,8 +102,11 @@ CONFIG = {
         "multi_family": _TEMPLATE_DIR / "multi_family_lease.docx",
     },
     "pending_dir":       _p("LEASE_PENDING_DIR", "Pending", root=_LEASES_ROOT),
+    "intake_dir":        _p("LEASE_INTAKE_DIR", "Intake", root=_LEASES_ROOT),
     "pending_cards_dir": _p("LEASE_CARDS_DIR", "approvals", "pending", root=_SHARED_ROOT),
+    "push_outbox_dir":   _p("LEASE_PUSH_OUTBOX", "push_outbox", root=_SHARED_ROOT),
     "dropbox_rel_root":  os.environ.get("LEASE_DROPBOX_REL_ROOT", "/Leases"),
+    "dropbox_token":     os.environ.get("LEASE_DROPBOX_TOKEN", ""),
     "soffice_bin":       _find_soffice(),
     "convert_timeout_s": int(os.environ.get("LEASE_CONVERT_TIMEOUT", "120")),
 }
@@ -109,6 +114,52 @@ CONFIG = {
 
 class LeaseFillError(Exception):
     pass
+
+
+_push_seq = 0
+
+
+def push(title, body, data=None):
+    """Drop a status push onto the Supervisor's push_outbox rail (swept every
+    15s). Used only for fill FAILURES — a successful fill's approval card
+    auto-pushes when it lands in approvals\\pending."""
+    global _push_seq
+    _push_seq += 1
+    outbox = CONFIG["push_outbox_dir"]
+    outbox.mkdir(parents=True, exist_ok=True)
+    payload = {"title": title, "body": body, "data": {**(data or {}), "kind": "lease"}}
+    name = f"lease-{os.getpid()}-{int(time.time() * 1000)}-{_push_seq}.json"
+    tmp = outbox / (name + ".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(outbox / name)
+
+
+def make_pdf_url(pdf_path):
+    """Create a Dropbox share URL for the filled lease so the approval card can
+    offer a tap-to-open button on Jay's phone. Needs a Dropbox token
+    (LEASE_DROPBOX_TOKEN) and the `dropbox` package. Degrades gracefully: if
+    either is missing the card is still queued, just without the link."""
+    token = CONFIG["dropbox_token"]
+    if not token:
+        return ""
+    rel = f"{CONFIG['dropbox_rel_root'].rstrip('/')}/Pending/{Path(pdf_path).name}"
+    try:
+        import dropbox
+        from dropbox.exceptions import ApiError
+    except ImportError:
+        print("WARN: `dropbox` package not installed — card will omit pdf_url "
+              "(pip install dropbox)")
+        return ""
+    try:
+        dbx = dropbox.Dropbox(token)
+        try:
+            return dbx.sharing_create_shared_link_with_settings(rel).url
+        except ApiError:
+            links = dbx.sharing_list_shared_links(path=rel, direct_only=True).links
+            return links[0].url if links else ""
+    except Exception as e:
+        print(f"WARN: Dropbox share-link generation failed ({e}) — card omits pdf_url")
+        return ""
 
 
 # ----------------------------------------------------------------------
@@ -367,19 +418,40 @@ def build_job(data, pdf_path):
 
 
 # ----------------------------------------------------------------------
-# APPROVALS-RAILS CONTRACT — the approval card. Mirror your real card shape
-# here (the write-side twin of lease_watcher's FLEET CONTRACT). NO SSN.
+# APPROVALS-RAILS CONTRACT — the approval card, matching the REAL supervisor
+# shape (ANSWERS_LEASEAGENT.md). Hard requirements: `id` (== filename, and it
+# encodes the job as lease-<slug> so the decision id maps back), `created_at`
+# (ISO, the sort key), `title` (push body), a flat human-first `body`, and the
+# `actions` array. `pdf_url` is the tap-to-open link. NO SSN anywhere here.
+# NOTE: the phone app needs a `kind:"lease"` card path added before these
+# render with the right buttons — that's an app-thread task (see the handoff).
 # ----------------------------------------------------------------------
-def build_card(data, job_id, pdf_path):
+def card_id_for(job_id):
+    return f"lease-{job_id}"
+
+
+def build_card(data, job_id, pdf_path, pdf_url=""):
+    tenants = "; ".join(f"{t['name']} <{t['email']}>" for t in data["tenants"])
+    kind_label = "Single-family" if data["lease_type"] == "single_family" else "Multifamily"
+    body = "\n".join([
+        f"Property: {data['property']}",
+        f"Type: {kind_label} lease",
+        f"Tenant(s): {tenants}",
+        f"Rent: ${data['rent']}/mo    Deposit: ${data['deposit']}",
+        f"Term: {data['term_start']} – {data['term_end']}",
+    ])
     rel = f"{CONFIG['dropbox_rel_root'].rstrip('/')}/Pending/{Path(pdf_path).name}"
-    return {
-        "kind": "lease",
+    card = {
+        "id": card_id_for(job_id),          # filename must equal this
         "agent": "lease",
-        "id": job_id,
-        "job": job_id,
-        "action_options": ["send", "reject"],
-        "title": f"Lease ready to send: {data['property']}",
-        "fields": {
+        "kind": "lease",
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "title": f"Lease ready: {data['property']}",
+        "subject": f"Lease ready: {data['property']}",
+        "body": body,
+        "actions": ["send", "reject"],      # no feedback until the fill agent honors it
+        "pdf_dropbox_path": rel,            # ignored by the supervisor; kept for reference
+        "fields": {                         # rides along for a future richer card
             "lease_type": data["lease_type"],
             "property": data["property"],
             "tenants": [{"name": t["name"], "email": t["email"]} for t in data["tenants"]],
@@ -387,9 +459,10 @@ def build_card(data, job_id, pdf_path):
             "deposit": f"${data['deposit']}",
             "term": f"{data['term_start']} – {data['term_end']}",
         },
-        "pdf_dropbox_path": rel,
-        "created": datetime.now().isoformat(timespec="seconds"),
     }
+    if pdf_url:
+        card["pdf_url"] = pdf_url
+    return card
 
 
 def _atomic_write(path, text):
@@ -422,21 +495,65 @@ def process_intake(intake_path, dry_run=False):
     job = build_job(data, pdf_path)
     _atomic_write(pending / f"{job_id}.json", json.dumps(job, indent=2))
 
-    # Card LAST: only advertise the job once PDF + job file are in place.
-    card = build_card(data, job_id, pdf_path)
-    _atomic_write(CONFIG["pending_cards_dir"] / f"{job_id}.json", json.dumps(card, indent=2))
+    pdf_url = make_pdf_url(pdf_path)   # tap-to-open link (empty if no Dropbox token)
 
-    print(f"queued {job_id}: {pdf_path}  (+ job file + approval card)")
+    # Card LAST: only advertise the job once PDF + job file are in place. Writing
+    # the card into approvals\pending IS the phone notification (supervisor sweep).
+    card = build_card(data, job_id, pdf_path, pdf_url)
+    _atomic_write(CONFIG["pending_cards_dir"] / f"{card['id']}.json", json.dumps(card, indent=2))
+
+    print(f"queued {card['id']}: {pdf_path}  (+ job file + approval card"
+          f"{'' if pdf_url else '; NO pdf_url — set LEASE_DROPBOX_TOKEN'})")
     return job_id
+
+
+def watch_intake(poll_seconds=5, settle_seconds=3):
+    """Watch the intake folder and fill each intake JSON as it lands. This is
+    the deployment mechanism: for now Jay (or any Claude chat) drops an
+    intake.json here; when Samantha /chat lands, its lease skill writes the
+    same file to the same folder and nothing here changes."""
+    intake_dir = CONFIG["intake_dir"]
+    processed = intake_dir / "_processed"
+    failed = intake_dir / "_failed"
+    for d in (intake_dir, processed, failed):
+        d.mkdir(parents=True, exist_ok=True)
+    print(f"LeaseFill watching {intake_dir} for *.json (Ctrl-C to stop)")
+    try:
+        while True:
+            for p in sorted(intake_dir.glob("*.json")):
+                try:
+                    if time.time() - p.stat().st_mtime < settle_seconds:
+                        continue
+                except FileNotFoundError:
+                    continue
+                try:
+                    process_intake(p)
+                    p.replace(processed / p.name)
+                except (LeaseFillError, Exception) as e:
+                    print(f"intake {p.name} FAILED: {e}", file=sys.stderr)
+                    push("Lease fill failed", f"{p.name}: {e}")
+                    try:
+                        p.replace(failed / p.name)
+                    except Exception:
+                        pass
+            time.sleep(poll_seconds)
+    except KeyboardInterrupt:
+        print("LeaseFill watcher stopped.")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--intake", required=True)
-    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--intake", help="fill one intake JSON")
+    ap.add_argument("--watch", action="store_true", help="watch the intake folder")
+    ap.add_argument("--dry-run", action="store_true", help="with --intake: build PDF only, queue nothing")
     args = ap.parse_args()
-    try:
-        process_intake(args.intake, dry_run=args.dry_run)
-    except LeaseFillError as e:
-        print(f"LEASE FILL ABORTED: {e}", file=sys.stderr)
-        sys.exit(1)
+    if args.watch:
+        watch_intake()
+    elif args.intake:
+        try:
+            process_intake(args.intake, dry_run=args.dry_run)
+        except LeaseFillError as e:
+            print(f"LEASE FILL ABORTED: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        ap.error("provide --intake <file> or --watch")

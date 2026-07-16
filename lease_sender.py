@@ -66,6 +66,7 @@ JOB FILE FORMAT (<job>.json):
 """
 
 import json
+import os
 import re
 import shutil
 import sys
@@ -86,7 +87,7 @@ CONFIG = {
     "sent_dir": r"D:\Dropbox\Dropbox\Leases\Sent",
     "failed_dir": r"D:\Dropbox\Dropbox\Leases\Failed",
     "audit_dir": r"D:\Dropbox\Dropbox\Leases\Audit",
-    "notify_file": r"C:\AIAgents\shared\notifications\lease_agent.jsonl",  # fleet notifier watches this
+    "push_outbox_dir": r"C:\AIAgents\shared\push_outbox",  # supervisor sweeps this -> phone push
     # Emails that may legitimately appear in the signer list besides the
     # tenant (e.g. Jay's own email if he countersigns). Compared normalized.
     "signer_whitelist": [],   # e.g. ["jay@premioproperty.com"]
@@ -150,26 +151,28 @@ _EMAIL_SCRAPE = r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
-def notify(level: str, message: str, job_name: str = ""):
-    """Append a notification for the fleet notifier to push to Jay's phone.
+_push_seq = 0
 
-    NOTE (handoff item): push now flows through the supervisor's Expo
-    pipeline. This still appends to the jsonl the old notifier tailed; if
-    the supervisor expects a different drop location/shape, that change
-    lives HERE and nowhere else.
+
+def notify(level: str, message: str, job_name: str = ""):
+    """Log locally always; for meaningful events (success/error) also drop a
+    push onto the Supervisor's push_outbox rail (swept every 15s -> Jay's
+    phone). Per the fleet contract, info-level steps do NOT push — one push
+    per meaningful event, sent or failed.
     """
-    entry = {
-        "ts": datetime.now().isoformat(timespec="seconds"),
-        "agent": "LeaseAgent",
-        "level": level,          # info | success | error
-        "job": job_name,
-        "message": message,
-    }
-    path = Path(CONFIG["notify_file"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
-    print(f"[{entry['ts']}] {level.upper()}: {message}")
+    global _push_seq
+    print(f"[{datetime.now().isoformat(timespec='seconds')}] {level.upper()}: {message}")
+    if level not in ("success", "error"):
+        return
+    _push_seq += 1
+    outbox = Path(CONFIG["push_outbox_dir"])
+    outbox.mkdir(parents=True, exist_ok=True)
+    title = "Lease sent" if level == "success" else "Lease agent error"
+    payload = {"title": title, "body": message, "data": {"kind": "lease", "job": job_name}}
+    name = f"lease-{os.getpid()}-{int(time.time() * 1000)}-{_push_seq}.json"
+    tmp = outbox / (name + ".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(outbox / name)
 
 
 class Auditor:
