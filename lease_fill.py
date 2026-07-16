@@ -1,46 +1,52 @@
 """
-LeaseFill — fills the single-family lease and queues it for approval
-====================================================================
+LeaseFill — fills a lease and queues it for approval
+====================================================
 Piece 3 of the pipeline (see HANDOFF_LEASE_AGENT.md). Takes a structured
-intake, overlays the tenant/lease data onto the landlord's OWN approved
-lease PDF, and drops the completed (unsigned) lease + a job file into
-Dropbox\\Leases\\Pending, then writes an approval card onto the existing
-approvals rails so the supervisor can push it to your phone.
+intake, fills the landlord's OWN Word lease (single-family OR multifamily),
+converts it to PDF with LibreOffice, and drops the completed (unsigned)
+lease + a job file into Dropbox\\Leases\\Pending, then writes an approval
+card onto the existing approvals rails so the supervisor can push it to your
+phone.
 
-Why overlay the real PDF instead of rebuilding it: the legal text stays
-byte-for-byte the landlord's approved document. We only draw values onto
-the blank lines. Signature / initial blocks are left untouched -- those are
-placed by Authentisign, not here.
+Why fill the .docx: values replace the blanks and the text reflows
+naturally -- no coordinate math, and adding/editing a template is trivial.
+The legal language stays the landlord's own. Signature / initial / Print
+Name / Date blocks are left untouched -- those are placed by Authentisign.
 
-FAIL-CLOSED: the blanks are located by the label to their left (robust to
-minor template edits), and if a REQUIRED blank can't be found the whole job
-aborts. A half-filled lease is never produced or queued.
+FAIL-CLOSED, twice over:
+  * Every blank is found by the text around it. If a REQUIRED field's anchor
+    is missing (the template changed), the whole job aborts -- a half-filled
+    lease is never produced or queued.
+  * LibreOffice exits 0 even when it fails to convert, so we verify the PDF
+    actually appeared and is non-empty; if not, we abort.
 
-SINGLE vs MULTI tenant: the template has two tenant slots. `tenants` may hold
-one or two people; each becomes an Authentisign signer, so each needs an
-email. Slot two is left blank for a single-tenant lease.
+SINGLE vs MULTI FAMILY: `lease_type` selects the template. Single-family has
+utility checkboxes and septic/oil clauses; multifamily does not and instead
+has an optional pets list. Both carry two tenant slots; `tenants` may hold
+one or two people, each of whom becomes an Authentisign signer.
 
-SENSITIVE DATA: SSNs, if supplied, are written ONLY onto the lease PDF. They
-are never written into the job file or the approval card (both of which sync
-to Dropbox / get pushed to a phone). SSN is optional -- omit it and the line
-is left blank.
+SENSITIVE DATA: SSNs, if supplied, are written ONLY onto the lease. They are
+never written into the job file or the approval card (both of which leave
+the machine). SSN is optional.
 
 RUN:
-  python lease_fill.py --intake intake.json      # fill + queue for approval
-  python lease_fill.py --intake intake.json --dry-run   # build PDF only,
-                        # write it next to the intake, queue NOTHING
+  python lease_fill.py --intake intake.json          # fill + queue
+  python lease_fill.py --intake intake.json --dry-run  # build PDF beside the
+                        # intake, queue NOTHING
 
 INTAKE FORMAT (intake.json):
 {
+  "lease_type": "single_family",          # or "multi_family"
   "landlord": "Premio Property Management LLC",
   "property": "123 Main St Apt 2, Waterbury CT",
   "premises_address": "123 Main St Apt 2, Waterbury, CT 06702",
-  "agreement_date": "2026-07-16",           # ISO or free text; omit = today
+  "agreement_date": "2026-07-16",         # ISO or free text; omit = today
   "term_start": "2026-08-01",
   "term_end":   "2027-07-31",
   "rent": "2,150",
   "deposit": "2,150",
-  "utilities": { "water": "City", "wastewater": "Sewer", "fuel": "Oil" },
+  "utilities": { "water": "City", "wastewater": "Sewer", "fuel": "Oil" },  # single_family only
+  "pets": ["Rex / Labrador / Black"],     # multi_family only, optional
   "tenants": [
     { "name": "John Smith", "email": "jsmith@example.com",
       "address": "123 Main St Apt 2", "city_state_zip": "Waterbury, CT 06702",
@@ -51,21 +57,23 @@ INTAKE FORMAT (intake.json):
 
 import argparse
 import json
+import os
 import re
-import shutil
+import subprocess
 import sys
 from datetime import date, datetime
 from pathlib import Path
 
-import fitz  # PyMuPDF
+import docx
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 # ----------------------------------------------------------------------
 # CONFIG — env-overridable; defaults mirror lease_watcher / the handoff
 # ----------------------------------------------------------------------
-import os
-
 _SHARED_ROOT = os.environ.get("LEASE_SHARED_ROOT", r"C:\AIAgents\shared")
 _LEASES_ROOT = os.environ.get("LEASE_DROPBOX_ROOT", r"C:\Users\Jay\Dropbox\Leases")
+_TEMPLATE_DIR = Path(os.environ.get("LEASE_TEMPLATE_DIR", str(Path(__file__).with_name("templates"))))
 
 
 def _p(env_key, *default_parts, root):
@@ -74,15 +82,15 @@ def _p(env_key, *default_parts, root):
 
 
 CONFIG = {
-    "template_pdf": Path(os.environ.get(
-        "LEASE_TEMPLATE_PDF", str(Path(__file__).with_name("templates") / "single_family_lease.pdf"))),
-    "pending_dir":     _p("LEASE_PENDING_DIR", "Pending", root=_LEASES_ROOT),
+    "templates": {
+        "single_family": _TEMPLATE_DIR / "single_family_lease.docx",
+        "multi_family": _TEMPLATE_DIR / "multi_family_lease.docx",
+    },
+    "pending_dir":       _p("LEASE_PENDING_DIR", "Pending", root=_LEASES_ROOT),
     "pending_cards_dir": _p("LEASE_CARDS_DIR", "approvals", "pending", root=_SHARED_ROOT),
-    # Dropbox-relative root used to build the phone-openable path in the card
-    "dropbox_rel_root": os.environ.get("LEASE_DROPBOX_REL_ROOT", "/Leases"),
-    "text_color": (0.0, 0.0, 0.55),   # dark blue, so fills read as filled-in
-    "font": "helv",
-    "font_size": 10.0,
+    "dropbox_rel_root":  os.environ.get("LEASE_DROPBOX_REL_ROOT", "/Leases"),
+    "soffice_bin":       os.environ.get("LEASE_SOFFICE", "soffice"),
+    "convert_timeout_s": int(os.environ.get("LEASE_CONVERT_TIMEOUT", "120")),
 }
 
 
@@ -91,144 +99,185 @@ class LeaseFillError(Exception):
 
 
 # ----------------------------------------------------------------------
-# Blank detection — find every underscore run with the text to its left
+# DOCX fill primitives — operate on <w:t> text only, so <w:br/> line breaks
+# and every other structural element are preserved untouched.
 # ----------------------------------------------------------------------
-def _blank_runs(page):
-    runs = []
-    for block in page.get_text("rawdict")["blocks"]:
-        for line in block.get("lines", []):
-            chars = [c for sp in line["spans"] for c in sp["chars"]]
-            i, n = 0, len(chars)
-            while i < n:
-                if chars[i]["c"] == "_":
-                    j = i
-                    while j < n and (chars[j]["c"] == "_" or
-                                     (chars[j]["c"] == " " and j + 1 < n and chars[j + 1]["c"] == "_")):
-                        j += 1
-                    x0 = chars[i]["bbox"][0]
-                    x1 = chars[j - 1]["bbox"][2]
-                    y1 = max(c["bbox"][3] for c in chars[i:j])
-                    left = "".join(c["c"] for c in chars[:i])
-                    runs.append({"x0": x0, "x1": x1, "y": y1, "w": x1 - x0, "left": left})
-                    i = j
-                else:
-                    i += 1
-    return runs
+_UND = re.compile(r"_{3,}")
 
 
-def _marker(page, text):
-    """Baseline anchor for a list marker like '1.' / '2.' (name goes after it)."""
-    for w in page.get_text("words"):
-        if w[4] == text:
-            return (w[0], w[3])  # x0, y-bottom
-    return None
+def _text_nodes(paragraph):
+    return list(paragraph._p.iter(qn("w:t")))
 
 
-def resolve_fields(doc):
-    """Locate every fillable blank on pages 1-2 and return field -> (x, y).
-
-    Raises LeaseFillError if a structurally-required blank is missing (the
-    template changed) -- we never silently drop a field on a legal doc.
-    """
-    p1_runs, p2_runs = _blank_runs(doc[0]), _blank_runs(doc[1])
-    f = {}
-
-    def one(runs, pred, why):
-        hits = [r for r in runs if pred(r)]
-        if not hits:
-            raise LeaseFillError(f"could not locate blank for {why}")
-        return hits[0]
-
-    def ordered(runs, pred):
-        return sorted([r for r in runs if pred(r)], key=lambda r: r["y"])
-
-    # Page 1 singletons
-    f["agreement_date"] = one(p1_runs, lambda r: "entered into on" in r["left"], "agreement date")
-    f["landlord"] = one(p1_runs, lambda r: "Landlord:" in r["left"], "landlord")
-    f["premises"] = one(p1_runs, lambda r: r["left"].strip() == "" and r["x0"] < 80 and r["w"] > 300, "premises address")
-
-    # Page 1 per-tenant (document order = tenant 1 then tenant 2)
-    addr = ordered(p1_runs, lambda r: "Address:" in r["left"])
-    csz = ordered(p1_runs, lambda r: r["left"].strip() == "" and r["x0"] > 100)
-    ssn = ordered(p1_runs, lambda r: "Social Security Number" in r["left"])
-    if len(addr) < 2 or len(csz) < 2 or len(ssn) < 2:
-        raise LeaseFillError("expected two tenant slots (address/city-state-zip/ssn) on page 1")
-    f["t_addr"], f["t_csz"], f["t_ssn"] = addr, csz, ssn
-    f["t_name_marker"] = [_marker(doc[0], "1."), _marker(doc[0], "2.")]
-
-    # Page 2 singletons
-    f["term_start"] = one(p2_runs, lambda r: "commence on" in r["left"], "term start")
-    f["term_end"] = one(p2_runs, lambda r: r["left"].strip() == "" and r["x0"] < 80 and r["y"] < 110, "term end")
-    f["rent"] = one(p2_runs, lambda r: "the sum of $" in r["left"], "monthly rent")
-    f["deposit"] = one(p2_runs, lambda r: "security deposit of $" in r["left"], "security deposit")
-
-    # Page 2 utility checkboxes, in document order
-    boxes = doc[1].search_for("[ ]")
-    if len(boxes) < 7:
-        raise LeaseFillError(f"expected 7 utility checkboxes, found {len(boxes)}")
-    f["boxes"] = boxes  # City, Well, Sewer, Septic, Oil, Gas, Propane
-    return f
-
-
-# ----------------------------------------------------------------------
-# Rendering the values onto the page
-# ----------------------------------------------------------------------
-def _put(page, x, y_bottom, text):
-    page.insert_text((x, y_bottom - 2.5), str(text),
-                     fontsize=CONFIG["font_size"], fontname=CONFIG["font"],
-                     color=CONFIG["text_color"])
-
-
-def _check(page, box_rect):
-    x = (box_rect[0] + box_rect[2]) / 2 - 2.6
-    _put(page, x, box_rect[3], "X")
-
-
-_UTIL_INDEX = {"city": 0, "well": 1, "sewer": 2, "septic": 3, "oil": 4, "gas": 5, "propane": 6}
-
-
-def fill_pdf(data, out_path):
-    doc = fitz.open(str(CONFIG["template_pdf"]))
-    fld = resolve_fields(doc)
-    p1, p2 = doc[0], doc[1]
-
-    _put(p1, fld["agreement_date"]["x0"] + 2, fld["agreement_date"]["y"], data["agreement_date"])
-    _put(p1, fld["landlord"]["x0"] + 2, fld["landlord"]["y"], data["landlord"])
-    _put(p1, fld["premises"]["x0"] + 2, fld["premises"]["y"], data["premises_address"])
-
-    for ti, t in enumerate(data["tenants"][:2]):
-        mk = fld["t_name_marker"][ti]
-        if mk:
-            _put(p1, mk[0] + 14, mk[1], t["name"])
-        _put(p1, fld["t_addr"][ti]["x0"] + 2, fld["t_addr"][ti]["y"], t.get("address", ""))
-        _put(p1, fld["t_csz"][ti]["x0"] + 2, fld["t_csz"][ti]["y"], t.get("city_state_zip", ""))
-        if t.get("ssn"):  # optional; PDF only, never persisted elsewhere
-            _put(p1, fld["t_ssn"][ti]["x0"] + 2, fld["t_ssn"][ti]["y"], t["ssn"])
-
-    _put(p2, fld["term_start"]["x0"] + 2, fld["term_start"]["y"], data["term_start"])
-    _put(p2, fld["term_end"]["x0"] + 2, fld["term_end"]["y"], data["term_end"])
-    _put(p2, fld["rent"]["x0"] + 2, fld["rent"]["y"], data["rent"])
-    _put(p2, fld["deposit"]["x0"] + 2, fld["deposit"]["y"], data["deposit"])
-
-    util = data.get("utilities", {})
-    for kind in ("water", "wastewater", "fuel"):
-        val = (util.get(kind) or "").strip().lower()
-        if not val:
+def fill_blanks(paragraph, values):
+    """Replace the underscore-runs in `paragraph`, in order, with `values`.
+    A None/"" value leaves that blank as-is. Returns how many blanks existed."""
+    vi = 0
+    for t in _text_nodes(paragraph):
+        s = t.text or ""
+        if "_" not in s:
             continue
-        if val not in _UTIL_INDEX:
-            raise LeaseFillError(f"unknown {kind} option {val!r} "
-                                 f"(expected one of {sorted(_UTIL_INDEX)})")
-        _check(p2, fld["boxes"][_UTIL_INDEX[val]])
+        out, last = [], 0
+        for m in _UND.finditer(s):
+            out.append(s[last:m.start()])
+            v = values[vi] if vi < len(values) else None
+            vi += 1
+            out.append(m.group(0) if v in (None, "") else str(v))
+            last = m.end()
+        out.append(s[last:])
+        t.text = "".join(out)
+    return vi
 
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    doc.save(str(out_path))
-    doc.close()
+
+def insert_before_break(paragraph, text):
+    """Put `text` on the line before the first <w:br/> (single-family tenant
+    name sits on the numbered-list line, which has no underscore blank)."""
+    for r in paragraph._p.iter(qn("w:r")):
+        br = r.find(qn("w:br"))
+        if br is not None:
+            t = OxmlElement("w:t")
+            t.set(qn("xml:space"), "preserve")
+            t.text = text
+            br.addprevious(t)
+            return True
+    raise LeaseFillError("expected a line break in the tenant block but found none")
+
+
+def check_nth_box(paragraph, index):
+    """Turn the index-th '[ ]' in the paragraph into '[X]'."""
+    cnt = 0
+    for t in _text_nodes(paragraph):
+        s = t.text or ""
+        if "[ ]" not in s:
+            continue
+        out, i = "", 0
+        while True:
+            j = s.find("[ ]", i)
+            if j < 0:
+                out += s[i:]
+                break
+            out += s[i:j] + ("[X]" if cnt == index else "[ ]")
+            cnt += 1
+            i = j + 3
+        t.text = out
+
+
+def _first(doc, needle, why):
+    for p in doc.paragraphs:
+        if needle in p.text:
+            return p
+    raise LeaseFillError(f"could not locate {why} (anchor {needle!r})")
+
+
+def _all(doc, *needles):
+    return [p for p in doc.paragraphs if all(n in p.text for n in needles)]
+
+
+# ----------------------------------------------------------------------
+# Template-aware filling
+# ----------------------------------------------------------------------
+_UTIL = {
+    "city": ("Water Supply:", 0), "well": ("Water Supply:", 1),
+    "sewer": ("Wastewater Disposal:", 0), "septic": ("Wastewater Disposal:", 1),
+    "oil": ("Fuel:", 0), "gas": ("Fuel:", 1), "propane": ("Fuel:", 2),
+}
+
+
+def _fill_document(data):
+    lease_type = data["lease_type"]
+    doc = docx.Document(str(CONFIG["templates"][lease_type]))
+
+    # Shared fields
+    fill_blanks(_first(doc, "entered into on", "agreement date"), [data["agreement_date"]])
+    landlord_p = next((p for p in doc.paragraphs if p.text.strip().startswith("Landlord:")), None)
+    if landlord_p is None:
+        raise LeaseFillError("could not locate landlord line")
+    fill_blanks(landlord_p, [data["landlord"]])
+    fill_blanks(_first(doc, "located at:", "premises address"), [data["premises_address"]])
+    fill_blanks(_first(doc, "shall commence on", "lease term"), [data["term_start"], data["term_end"]])
+    fill_blanks(_first(doc, "the sum of $", "monthly rent"), [data["rent"]])
+    fill_blanks(_first(doc, "security deposit of $", "security deposit"), [data["deposit"]])
+
+    # Tenants (two slots; fill one or two)
+    blocks = _all(doc, "Address:", "City, State, Zip:")
+    ssns = [p for p in doc.paragraphs if "Social Security Number" in p.text]
+    if len(blocks) < 2 or len(ssns) < 2:
+        raise LeaseFillError("expected two tenant slots in the template")
+    for ti, t in enumerate(data["tenants"][:2]):
+        if lease_type == "multi_family":
+            fill_blanks(blocks[ti], [t["name"], t.get("address", ""), t.get("city_state_zip", "")])
+        else:
+            insert_before_break(blocks[ti], t["name"])
+            fill_blanks(blocks[ti], [t.get("address", ""), t.get("city_state_zip", "")])
+        if t.get("ssn"):
+            fill_blanks(ssns[ti], [t["ssn"]])
+
+    # Single-family utility checkboxes
+    if lease_type == "single_family":
+        for kind in ("water", "wastewater", "fuel"):
+            val = (data.get("utilities", {}).get(kind) or "").strip().lower()
+            if not val:
+                continue
+            if val not in _UTIL:
+                raise LeaseFillError(f"unknown {kind} option {val!r} (expected {sorted(k for k,(a,_) in _UTIL.items() if a==_UTIL[val][0])})")
+            anchor, idx = _UTIL[val]
+            check_nth_box(_first(doc, anchor, f"{kind} checkbox"), idx)
+
+    # Multifamily optional pets
+    if lease_type == "multi_family" and data.get("pets"):
+        pet_lines = [p for p in doc.paragraphs if "(Name / Breed / Color)" in p.text]
+        for pi, pet in enumerate(data["pets"][:len(pet_lines)]):
+            fill_blanks(pet_lines[pi], [pet])
+
+    return doc
+
+
+def _docx_to_pdf(docx_path, out_dir):
+    """Convert with LibreOffice. soffice exits 0 even on failure, so success
+    is decided by whether the PDF actually appeared."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    profile = out_dir / f".lo-{docx_path.stem}"
+    env = dict(os.environ)
+    env.setdefault("HOME", str(out_dir))  # soffice needs a writable HOME
+    cmd = [CONFIG["soffice_bin"], "--headless",
+           f"-env:UserInstallation=file://{profile}",
+           "--convert-to", "pdf", "--outdir", str(out_dir), str(docx_path)]
+    try:
+        subprocess.run(cmd, env=env, capture_output=True,
+                       timeout=CONFIG["convert_timeout_s"])
+    except FileNotFoundError:
+        raise LeaseFillError(f"LibreOffice not found ({CONFIG['soffice_bin']!r}). "
+                             f"Install LibreOffice on this PC or set LEASE_SOFFICE.")
+    except subprocess.TimeoutExpired:
+        raise LeaseFillError("LibreOffice conversion timed out")
+    pdf = out_dir / (docx_path.stem + ".pdf")
+    if not pdf.exists() or pdf.stat().st_size == 0:
+        raise LeaseFillError("DOCX->PDF conversion produced no PDF "
+                             "(is LibreOffice working on this PC?)")
+    return pdf
+
+
+def fill_lease_pdf(data, out_pdf):
+    """Fill the template and render it to out_pdf. Returns out_pdf."""
+    out_pdf = Path(out_pdf)
+    doc = _fill_document(data)
+    tmp_docx = out_pdf.with_suffix(".docx")
+    doc.save(str(tmp_docx))
+    try:
+        produced = _docx_to_pdf(tmp_docx, out_pdf.parent)
+        if produced.resolve() != out_pdf.resolve():
+            produced.replace(out_pdf)
+    finally:
+        tmp_docx.unlink(missing_ok=True)
+    return out_pdf
 
 
 # ----------------------------------------------------------------------
 # Intake -> normalized data
 # ----------------------------------------------------------------------
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_LEASE_TYPES = {"single_family", "multi_family"}
 
 
 def _fmt_date(v):
@@ -239,12 +288,15 @@ def _fmt_date(v):
             return datetime.strptime(v, fmt).strftime("%B %-d, %Y")
         except ValueError:
             pass
-    return str(v)  # already free text; use as-is
+    return str(v)
 
 
 def normalize_intake(raw):
     if not isinstance(raw, dict):
         raise LeaseFillError("intake is not a JSON object")
+    lease_type = raw.get("lease_type")
+    if lease_type not in _LEASE_TYPES:
+        raise LeaseFillError(f"lease_type must be one of {sorted(_LEASE_TYPES)}, got {lease_type!r}")
     tenants = raw.get("tenants") or []
     if not (1 <= len(tenants) <= 2):
         raise LeaseFillError("intake must have 1 or 2 tenants")
@@ -258,6 +310,7 @@ def normalize_intake(raw):
     if missing:
         raise LeaseFillError(f"intake missing fields: {missing}")
     return {
+        "lease_type": lease_type,
         "landlord": raw["landlord"],
         "property": raw["property"],
         "premises_address": raw["premises_address"],
@@ -267,6 +320,7 @@ def normalize_intake(raw):
         "rent": raw["rent"],
         "deposit": raw["deposit"],
         "utilities": raw.get("utilities", {}),
+        "pets": raw.get("pets", []),
         "tenants": tenants,
     }
 
@@ -280,7 +334,7 @@ def job_id_for(data):
     return f"{_slug(data['property'])}-{_slug(surname)}"[:80]
 
 
-def build_job(data, job_id, pdf_path):
+def build_job(data, pdf_path):
     """The job contract lease_watcher / lease_sender consume. NO SSN here."""
     signers = [{"name": t["name"], "email": t["email"]} for t in data["tenants"]]
     surname = data["tenants"][0]["name"].split()[-1]
@@ -288,8 +342,7 @@ def build_job(data, job_id, pdf_path):
         "property": data["property"],
         "signing_name": f"Lease - {data['property']} - {surname}",
         "signers": signers,
-        # legacy single-signer mirror so an older consumer still works
-        "tenant_name": signers[0]["name"],
+        "tenant_name": signers[0]["name"],    # legacy single-signer mirror
         "tenant_email": signers[0]["email"],
         "pdf_path": str(pdf_path),
     }
@@ -297,8 +350,7 @@ def build_job(data, job_id, pdf_path):
 
 # ----------------------------------------------------------------------
 # APPROVALS-RAILS CONTRACT — the approval card. Mirror your real card shape
-# here (this is the write-side twin of lease_watcher's FLEET CONTRACT block)
-# and nowhere else. NO SSN is ever placed on the card.
+# here (the write-side twin of lease_watcher's FLEET CONTRACT). NO SSN.
 # ----------------------------------------------------------------------
 def build_card(data, job_id, pdf_path):
     rel = f"{CONFIG['dropbox_rel_root'].rstrip('/')}/Pending/{Path(pdf_path).name}"
@@ -310,13 +362,14 @@ def build_card(data, job_id, pdf_path):
         "action_options": ["send", "reject"],
         "title": f"Lease ready to send: {data['property']}",
         "fields": {
+            "lease_type": data["lease_type"],
             "property": data["property"],
             "tenants": [{"name": t["name"], "email": t["email"]} for t in data["tenants"]],
             "rent": f"${data['rent']}/mo",
             "deposit": f"${data['deposit']}",
             "term": f"{data['term_start']} – {data['term_end']}",
         },
-        "pdf_dropbox_path": rel,   # the app resolves this to a tap-to-open link
+        "pdf_dropbox_path": rel,
         "created": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -336,21 +389,22 @@ def process_intake(intake_path, dry_run=False):
 
     if dry_run:
         out = Path(intake_path).with_name(f"{job_id}.pdf")
-        fill_pdf(data, out)
+        fill_lease_pdf(data, out)
         print(f"[DRY-RUN] filled PDF written to {out} (nothing queued)")
         return out
 
     pending = CONFIG["pending_dir"]
-    pdf_path = pending / f"{job_id}.pdf"
-    # Fill to a temp then move, so a half-written PDF is never visible in Pending.
+    pending.mkdir(parents=True, exist_ok=True)
+    # Fill to a temp name then move, so a half-written PDF is never seen in Pending.
     tmp_pdf = pending / f".{job_id}.pdf.tmp"
-    fill_pdf(data, tmp_pdf)
-    Path(tmp_pdf).replace(pdf_path)
+    fill_lease_pdf(data, tmp_pdf)
+    pdf_path = pending / f"{job_id}.pdf"
+    tmp_pdf.replace(pdf_path)
 
-    job = build_job(data, job_id, pdf_path)
+    job = build_job(data, pdf_path)
     _atomic_write(pending / f"{job_id}.json", json.dumps(job, indent=2))
 
-    # Card LAST: only advertise the job once the PDF + job file are in place.
+    # Card LAST: only advertise the job once PDF + job file are in place.
     card = build_card(data, job_id, pdf_path)
     _atomic_write(CONFIG["pending_cards_dir"] / f"{job_id}.json", json.dumps(card, indent=2))
 
