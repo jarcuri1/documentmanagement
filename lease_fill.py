@@ -72,7 +72,7 @@ from docx.oxml.ns import qn
 # CONFIG — env-overridable; defaults mirror lease_watcher / the handoff
 # ----------------------------------------------------------------------
 _SHARED_ROOT = os.environ.get("LEASE_SHARED_ROOT", r"C:\AIAgents\shared")
-_LEASES_ROOT = os.environ.get("LEASE_DROPBOX_ROOT", r"C:\Users\realt\Dropbox\Leases")
+_LEASES_ROOT = os.environ.get("LEASE_DROPBOX_ROOT", r"D:\Dropbox\Dropbox\Leases")
 _TEMPLATE_DIR = Path(os.environ.get("LEASE_TEMPLATE_DIR", str(Path(__file__).with_name("templates"))))
 
 

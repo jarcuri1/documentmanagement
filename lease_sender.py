@@ -82,10 +82,10 @@ CONFIG = {
     "smartmls_url": "https://www.smartmls.com",
     "template_name": "CE Residential Lease",          # exact Authentisign template name
     "browser_profile_dir": r"C:\AIAgents\LeaseAgent\chrome-profile",
-    "dropbox_root": r"C:\Users\realt\Dropbox\Leases",   # adjust if Dropbox lives elsewhere
-    "sent_dir": r"C:\Users\realt\Dropbox\Leases\Sent",
-    "failed_dir": r"C:\Users\realt\Dropbox\Leases\Failed",
-    "audit_dir": r"C:\Users\realt\Dropbox\Leases\Audit",
+    "dropbox_root": r"D:\Dropbox\Dropbox\Leases",   # adjust if Dropbox lives elsewhere
+    "sent_dir": r"D:\Dropbox\Dropbox\Leases\Sent",
+    "failed_dir": r"D:\Dropbox\Dropbox\Leases\Failed",
+    "audit_dir": r"D:\Dropbox\Dropbox\Leases\Audit",
     "notify_file": r"C:\AIAgents\shared\notifications\lease_agent.jsonl",  # fleet notifier watches this
     # Emails that may legitimately appear in the signer list besides the
     # tenant (e.g. Jay's own email if he countersigns). Compared normalized.
