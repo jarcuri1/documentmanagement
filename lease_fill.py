@@ -72,13 +72,26 @@ from docx.oxml.ns import qn
 # CONFIG — env-overridable; defaults mirror lease_watcher / the handoff
 # ----------------------------------------------------------------------
 _SHARED_ROOT = os.environ.get("LEASE_SHARED_ROOT", r"C:\AIAgents\shared")
-_LEASES_ROOT = os.environ.get("LEASE_DROPBOX_ROOT", r"C:\Users\Jay\Dropbox\Leases")
+_LEASES_ROOT = os.environ.get("LEASE_DROPBOX_ROOT", r"C:\Users\realt\Dropbox\Leases")
 _TEMPLATE_DIR = Path(os.environ.get("LEASE_TEMPLATE_DIR", str(Path(__file__).with_name("templates"))))
 
 
 def _p(env_key, *default_parts, root):
     v = os.environ.get(env_key)
     return Path(v) if v else Path(root, *default_parts)
+
+
+def _find_soffice():
+    """LibreOffice isn't on PATH after a default Windows install, so look in
+    the standard install locations before falling back to the PATH name."""
+    override = os.environ.get("LEASE_SOFFICE")
+    if override:
+        return override
+    for c in (r"C:\Program Files\LibreOffice\program\soffice.exe",
+              r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"):
+        if Path(c).exists():
+            return c
+    return "soffice"
 
 
 CONFIG = {
@@ -89,7 +102,7 @@ CONFIG = {
     "pending_dir":       _p("LEASE_PENDING_DIR", "Pending", root=_LEASES_ROOT),
     "pending_cards_dir": _p("LEASE_CARDS_DIR", "approvals", "pending", root=_SHARED_ROOT),
     "dropbox_rel_root":  os.environ.get("LEASE_DROPBOX_REL_ROOT", "/Leases"),
-    "soffice_bin":       os.environ.get("LEASE_SOFFICE", "soffice"),
+    "soffice_bin":       _find_soffice(),
     "convert_timeout_s": int(os.environ.get("LEASE_CONVERT_TIMEOUT", "120")),
 }
 

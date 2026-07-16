@@ -66,7 +66,7 @@ from pathlib import Path
 # CONFIG — env-overridable; defaults match HANDOFF_LEASE_AGENT.md
 # ----------------------------------------------------------------------
 _SHARED_ROOT = os.environ.get("LEASE_SHARED_ROOT", r"C:\AIAgents\shared")
-_LEASES_ROOT = os.environ.get("LEASE_DROPBOX_ROOT", r"C:\Users\Jay\Dropbox\Leases")
+_LEASES_ROOT = os.environ.get("LEASE_DROPBOX_ROOT", r"C:\Users\realt\Dropbox\Leases")
 
 
 def _path(env_key: str, *default_parts, root: str) -> Path:
