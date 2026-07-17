@@ -1,10 +1,12 @@
 """
-LeaseAgent — unattended Authentisign sender
+LeaseAgent — unattended SmartMLS Sign sender
 ============================================
 Runs on the fleet PC. Takes an APPROVED lease job, drives a real Chrome
-window into SmartMLS -> Authentisign, creates the signing from your saved
-lease template, adds the tenant, verifies everything on-screen matches the
-approved job, clicks Send, and files the audit trail to Dropbox.
+window into SmartMLS Sign (SmartMLS's built-in e-signature, hosted at
+signings.smartmls.propkit.io and reached through SmartMLS SSO), creates a
+new signing from the filled lease PDF, adds the tenant(s) as signer(s),
+verifies everything on-screen matches the approved job, clicks Send, and
+files the audit trail to Dropbox.
 
 This is piece 2 of the pipeline (see HANDOFF_LEASE_AGENT.md). It is invoked
 by lease_watcher.py, which has already CLAIMED the job by moving its JSON
@@ -12,12 +14,17 @@ into Dropbox\\Leases\\Sending before this script launches. That claim-first
 move is what makes double-sends impossible; this script must therefore
 never put a job back into a pickable state (Pending) on its own.
 
+The signing is NAMED from job["signing_name"] ("Lease - <property> -
+<surname>"). SmartMLS Sign echoes that name into the "eSigning Completed |
+<name>" email when signing finishes, which is how the filing agent
+(lease_filer) later correlates the returned PDF back to this job -- so the
+name must not be left as a template default.
+
 DESIGN RULES (do not soften these):
   1. Script never guesses. Any unexpected page/element -> screenshot,
      abort, notify. No retries past MAX_RETRIES, no creative clicking.
-  2. Send is only clicked after the on-screen tenant email matches the
-     approved email (normalized, case-insensitive) AND no unexpected email
-     appears in the signer list.
+  2. Send is only clicked after every approved signer email matches on
+     screen (normalized, case-insensitive) AND no unexpected email appears.
   3. Every step screenshots to the job's Dropbox folder (audit trail).
   4. File placement is one-way. On a pre-send abort the job goes to Failed.
      On any failure AFTER Send was clicked the job is LEFT in Sending and
@@ -28,15 +35,17 @@ ONE-TIME SETUP (do this while at the PC):
   1. pip install playwright && playwright install chrome
   2. Log the automation profile in once:
        python lease_sender.py --setup
-     A Chrome window opens using the persistent profile. Log into
-     smartmls.com (complete any MFA), open Authentisign once, then close
-     the window. Cookies persist in BROWSER_PROFILE_DIR.
-  3. Build your Authentisign template ("CE Residential Lease" or similar)
-     with all signature/initial/date blocks pre-placed. Put its exact
-     name in CONFIG["template_name"].
-  4. Capture real selectors: Authentisign 2.0's DOM will not match my
-     placeholders exactly. Run:
-       playwright codegen --user-data-dir="<BROWSER_PROFILE_DIR>" https://www.smartmls.com
+     A Chrome window opens on the persistent profile at the SmartMLS Sign
+     app. Click "Sign in with Smart MLS", complete the SmartMLS login (+ any
+     MFA), land on the Signings dashboard, then close the window. Cookies
+     persist in BROWSER_PROFILE_DIR.
+  3. In SmartMLS Sign -> Templates (Forms), build a signature-field template
+     for the lease (signature / initial / date blocks pre-placed) and put
+     its exact name in CONFIG["template_name"]. (If you place fields by hand
+     instead, adjust the apply-template step.)
+  4. Capture real selectors: the app's DOM will not match my placeholders.
+     Run:
+       playwright codegen --user-data-dir="<BROWSER_PROFILE_DIR>" https://signings.smartmls.propkit.io/signings
      Walk through one signing manually; codegen prints the selectors.
      Update the SELECTORS dict below -- it's the ONLY place they live.
   5. Put your own signer email (if you countersign) in
@@ -47,7 +56,7 @@ PER-LEASE FLOW (wired into the fleet):
   - Supervisor pushes an approval card; you tap Approve in the Samantha app
   - lease_watcher.py consumes the `send` decision, CLAIMS the job
     (Pending -> Sending), then runs:
-       python lease_sender.py --job "C:\\...\\Sending\\123-main-smith.json"
+       python lease_sender.py --job "D:\\...\\Sending\\<slug>.json"
 
 EXIT CODES (read by lease_watcher):
   0  sent and filed to Sent
@@ -58,10 +67,9 @@ EXIT CODES (read by lease_watcher):
 JOB FILE FORMAT (<job>.json):
 {
   "property": "123 Main St Apt 2, Waterbury CT",
-  "tenant_name": "John Smith",
-  "tenant_email": "jsmith@example.com",
-  "pdf_path": "C:\\Users\\Jay\\Dropbox\\Leases\\Pending\\123-main-smith.pdf",
-  "signing_name": "Lease - 123 Main St Apt 2 - Smith"
+  "signing_name": "Lease - 123 Main St Apt 2, Waterbury CT - Smith",
+  "signers": [{"name": "John Smith", "email": "jsmith@example.com"}],
+  "pdf_path": "D:\\Dropbox\\Dropbox\\Leases\\Sending\\123-main-st-smith.pdf"
 }
 """
 
@@ -80,8 +88,8 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # CONFIG — edit paths to match the fleet layout
 # ----------------------------------------------------------------------
 CONFIG = {
-    "smartmls_url": "https://www.smartmls.com",
-    "template_name": "CE Residential Lease",          # exact Authentisign template name
+    "sign_url": "https://signings.smartmls.propkit.io/signings",  # SmartMLS Sign app
+    "template_name": "Residential Lease",   # exact name of your SmartMLS Sign field template (Templates > Forms)
     "browser_profile_dir": r"C:\AIAgents\LeaseAgent\chrome-profile",
     "dropbox_root": r"D:\Dropbox\Dropbox\Leases",   # adjust if Dropbox lives elsewhere
     "sent_dir": r"D:\Dropbox\Dropbox\Leases\Sent",
@@ -100,38 +108,35 @@ CONFIG = {
 # This dict is the single source of truth; nothing else hardcodes selectors.
 # ----------------------------------------------------------------------
 SELECTORS = {
-    # SmartMLS dashboard
-    "authentisign_tile":    "text=Authentisign",           # tile on Member Dashboard
-    "logged_in_marker":     "text=Member Dashboard",       # proves session is alive
+    # SmartMLS Sign — Signings dashboard
+    "logged_in_marker":     "text=New Signing",            # proves the SSO session is alive
+    "signin_with_mls_btn":  "button:has-text('Sign in with Smart MLS')",  # only during --setup
 
-    # Create Signing screen
-    "new_signing_btn":      "[data-testid='add-signing']",  # the + / Add icon
-    "signing_name_input":   "input[name='signingName']",
+    # New signing
+    "new_signing_btn":      "button:has-text('New Signing')",
+    "signing_name_input":   "input[name='name']",
     "create_btn":           "button:has-text('Create')",
 
-    # Add document
-    "add_doc_btn":          "button:has-text('Add Document')",
+    # Add document (upload the filled lease PDF)
     "upload_input":         "input[type='file']",           # direct file upload path
-    "doc_uploaded_marker":  ".document-thumbnail",
+    "doc_uploaded_marker":  ".document-uploaded",           # row/thumbnail confirming upload
 
-    # Apply template
-    "templates_btn":        "button:has-text('Templates')",
+    # Apply the saved signature-field template (Templates > Forms)
+    "templates_btn":        "button:has-text('Apply Template')",
     "template_row":         "text={template_name}",         # filled at runtime
     "apply_template_btn":   "button:has-text('Apply')",
 
-    # Participants
-    "signers_btn":          "button:has-text('Signers')",
-    "add_participant_btn":  "button:has-text('Add Participants')",
-    "add_new_contact":      "text=Add New",
-    "participant_name":     "input[name='fullName']",
-    "participant_email":    "input[name='email']",
-    "participant_role":     "select[name='role']",          # choose tenant/lessee role
-    "participant_save":     "button:has-text('Save')",
+    # Signers (one or two tenants)
+    "add_signer_btn":       "button:has-text('Add Signer')",
+    "signer_name":          "input[name='signerName']",
+    "signer_email":         "input[name='signerEmail']",
+    "signer_role":          "select[name='role']",          # optional; ignored if absent
+    "signer_save":          "button:has-text('Save')",
 
     # Review + send
-    "review_email_text":    ".participant-list",            # container we read email back from
+    "review_email_text":    ".signers-list",                # container we read emails back from
     "send_btn":             "button:has-text('Send')",
-    "sent_confirmation":    "text=invitation",              # 'signing invites will be sent'
+    "sent_confirmation":    "text=has been sent",           # confirmation toast/text
 }
 
 MAX_RETRIES = 1  # per step; beyond this we abort, never improvise
@@ -247,33 +252,27 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
     t = CONFIG["step_timeout_ms"]
     S = SELECTORS
 
-    # 1. SmartMLS — confirm we're logged in (never type credentials here)
-    def goto_dashboard():
-        page.goto(CONFIG["smartmls_url"], timeout=t)
+    # 1. Open SmartMLS Sign; confirm the SSO session is alive (never type creds)
+    def goto_app():
+        page.goto(CONFIG["sign_url"], timeout=t)
         page.wait_for_selector(S["logged_in_marker"], timeout=t)
-    step(auditor, "smartmls dashboard (session alive)", goto_dashboard)
+    step(auditor, "smartmls sign dashboard (session alive)", goto_app)
 
-    # 2. Open Authentisign
-    def open_authentisign():
-        page.click(S["authentisign_tile"], timeout=t)
-        page.wait_for_load_state("networkidle", timeout=t)
-    step(auditor, "open authentisign", open_authentisign)
-
-    # 3. New signing with the job's name
+    # 2. New signing, NAMED from the job (the name drives completion-email
+    #    correlation, so it must be set — never left as a template default)
     def create_signing():
         page.click(S["new_signing_btn"], timeout=t)
         page.fill(S["signing_name_input"], job["signing_name"], timeout=t)
         page.click(S["create_btn"], timeout=t)
     step(auditor, "create signing", create_signing)
 
-    # 4. Upload the filled lease PDF
+    # 3. Upload the filled lease PDF
     def add_document():
-        page.click(S["add_doc_btn"], timeout=t)
         page.set_input_files(S["upload_input"], job["pdf_path"], timeout=t)
         page.wait_for_selector(S["doc_uploaded_marker"], timeout=t)
     step(auditor, "upload lease pdf", add_document)
 
-    # 5. Apply the saved lease template (pre-placed signature blocks)
+    # 4. Apply the saved signature-field template (Templates > Forms)
     def apply_template():
         page.click(S["templates_btn"], timeout=t)
         row = S["template_row"].format(template_name=CONFIG["template_name"])
@@ -281,19 +280,17 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         page.click(S["apply_template_btn"], timeout=t)
     step(auditor, "apply lease template", apply_template)
 
-    # 6. Add each signer as a participant (one or two tenants)
+    # 5. Add each signer (one or two tenants)
     def add_signers():
-        page.click(S["signers_btn"], timeout=t)
         for s in signers_of(job):
-            page.click(S["add_participant_btn"], timeout=t)
-            page.click(S["add_new_contact"], timeout=t)
-            page.fill(S["participant_name"], s["name"], timeout=t)
-            page.fill(S["participant_email"], s["email"], timeout=t)
+            page.click(S["add_signer_btn"], timeout=t)
+            page.fill(S["signer_name"], s["name"], timeout=t)
+            page.fill(S["signer_email"], s["email"], timeout=t)
             # role select is optional depending on template roles; ignore if absent
-            if page.locator(S["participant_role"]).count():
-                page.select_option(S["participant_role"], label="Tenant")
-            page.click(S["participant_save"], timeout=t)
-    step(auditor, "add tenant participants", add_signers)
+            if page.locator(S["signer_role"]).count():
+                page.select_option(S["signer_role"], label="Tenant")
+            page.click(S["signer_save"], timeout=t)
+    step(auditor, "add tenant signers", add_signers)
 
     # 7. HARD CHECK — every approved signer email must appear on-screen exactly
     #    (normalized, case-insensitive) and no OTHER email may appear.
@@ -356,7 +353,7 @@ def process_job(job_path: Path):
                 notify("error",
                        f"AMBIGUOUS: Send was clicked for {job['property']} "
                        f"({recipients}) but confirmation was not observed ({e}). Job "
-                       f"LEFT in Sending — verify in Authentisign before any resend. "
+                       f"LEFT in Sending — verify in SmartMLS Sign before any resend. "
                        f"Audit: {auditor.dir}", name)
                 sys.exit(2)
             # Clean pre-send abort: nothing was sent, safe to file to Failed.
@@ -393,9 +390,9 @@ def setup_profile():
         ctx = p.chromium.launch_persistent_context(
             CONFIG["browser_profile_dir"], channel="chrome", headless=False)
         page = ctx.new_page()
-        page.goto(CONFIG["smartmls_url"])
-        print("Log into SmartMLS (complete MFA), open Authentisign once, "
-              "then close the browser window.")
+        page.goto(CONFIG["sign_url"])
+        print("Click 'Sign in with Smart MLS', complete the SmartMLS login "
+              "(+ any MFA), land on the Signings dashboard, then close the window.")
         try:
             page.wait_for_event("close", timeout=0)
         except Exception:
