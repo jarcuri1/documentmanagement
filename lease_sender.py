@@ -147,36 +147,51 @@ SELECTORS = {
     # redirecting. We detect it and abort loudly (a human must re-trust).
     "sso_mfa_marker":       "text=/one[- ]time code|verification code|authenticator|otp/i",
 
-    # New signing
-    "new_signing_btn":      "button:has-text('New Signing')",
-    "signing_name_input":   "input[name='name']",
-    "create_btn":           "button:has-text('Create')",
+    # --- New signing: startup screen (/signings/edit?isStartUp=true) ---
+    "new_signing_btn":      "[data-testid='signings-create-btn']",
+    "signing_name_input":   "[data-testid='signing-form-signing-details-dialog-edit-name-input']",
+    # Reveal the uploader, then set files on the hidden input. Continue is only
+    # enabled once at least one document is uploaded.
+    "upload_reveal_btn":    "[data-testid='signing-form-signing-upload-file-btn']",
+    "upload_input":         "[data-testid='editor-document-uploader-input']",
+    "continue_btn":         "[data-testid='signing-form-save-and-continue-btn']",
 
-    # Add document (upload the filled lease PDF)
-    "upload_input":         "input[type='file']",           # direct file upload path
-    "doc_uploaded_marker":  ".document-uploaded",           # row/thumbnail confirming upload
+    # --- Editor: documents ---
+    "add_documents_btn":    "button:has-text('+ Add Document(s)')",
+    "select_template_btn":  "button:has-text('Select Template')",
+    # A template/overlay is chosen by clicking its name (get_by_text, exact) then
+    # this Select button applies it.
+    "picker_select_btn":    "button:has-text('Select')",
+    # Per-document settings gear (its SVG path is the stable handle; the sibling
+    # trash icon is path d^='M4.5 5.57' — never click that). Scoped to a doc row
+    # at runtime so we act on the right document.
+    "doc_gear_svg_path":    "path[d^='M12 15.75']",
+    "apply_overlay_item":   "text=Apply Signing Overlay",
 
-    # Apply the saved signature-field template (Templates > Forms)
-    "templates_btn":        "button:has-text('Apply Template')",
-    "template_row":         "text={template_name}",         # filled at runtime
-    "apply_template_btn":   "button:has-text('Apply')",
+    # --- Editor: participants (Signing Flow) ---
+    # Applying the overlay pre-creates ONE participant row; edit it for the first
+    # signer, then '+ Add Participant' for the rest. Each opens the "Edit
+    # Participant" modal. Role is a dropdown of generic role types (Landlord,
+    # Tenant, ...) — two Tenant participants become the overlay's Tenant (1) /
+    # Tenant (2) by order.
+    "add_participant_btn":  "[data-testid='add-role']",
+    "edit_participant_btn": "[data-testid='button-edit-participant']",
+    "participant_section":  "[data-testid='element-participant']",
+    "participant_role":     "[data-testid='role-selector-participant']",   # click to open the list
+    "participant_first":    "[data-testid='name-participant'] input",
+    "participant_last":     "[data-testid='lastname-participant'] input",
+    "participant_email":    "[data-testid='email-participant'] input",
+    "participant_type":     "[data-testid='type-participant']",
+    "participant_save":     "[data-testid='dialog-prompt-ok-btn']",     # 'Save'
+    "participant_cancel":   "[data-testid='dialog-prompt-cancel-btn']",
 
-    # Signers (landlord person + one or two tenants). Reuse existing contacts.
-    "add_signer_btn":       "button:has-text('Add Signer')",
-    "contact_search":       "input[placeholder='Search contacts']",  # existing-contact search
-    "contact_result":       "text={name}",                  # a matching existing contact row
-    "signer_name":          "input[name='signerName']",
-    "signer_email":         "input[name='signerEmail']",
-    "signer_role":          "select[name='role']",          # optional; ignored if absent
-    "signer_save":          "button:has-text('Save')",
-    # Delete the unused 2nd-tenant role + its fields on a single-tenant signing
-    # (the overlay is built for two tenants; an unassigned role blocks Send).
-    "remove_second_tenant": "[data-role='Tenant 2'] button:has-text('Remove')",
-
-    # Review + send
-    "review_email_text":    ".signers-list",                # container we read emails back from
-    "send_btn":             "button:has-text('Send')",
-    "sent_confirmation":    "text=has been sent",           # confirmation toast/text
+    # --- Review + send ---
+    # Emails render inside the participant sections; we read them back from there.
+    "review_email_text":    "[data-testid='element-participant']",
+    "send_btn":             "button:has-text('Send Signing')",
+    # Post-send the signing flips to a state showing Resend/Withdraw; we also
+    # accept an explicit success toast. Confirmed/adjusted on the first live run.
+    "sent_confirmation":    "text=/has been sent|successfully sent|Resend signing|Withdraw/i",
 }
 
 MAX_RETRIES = 1  # per step; beyond this we abort, never improvise
@@ -402,6 +417,148 @@ def load_job(path: Path) -> dict:
 
 
 # ----------------------------------------------------------------------
+# UI helpers — the real SmartMLS Sign flow (see SIGN_UI_MAP.md)
+# ----------------------------------------------------------------------
+def _doc_display_name(pdf_path) -> str:
+    """How an uploaded PDF's name renders in the Documents panel (no extension)."""
+    return Path(pdf_path).stem
+
+
+def _split_name(full: str):
+    """('First Middle', 'Last') from a full name; last token is the surname."""
+    parts = full.split()
+    if len(parts) <= 1:
+        return (parts[0] if parts else ""), ""
+    return " ".join(parts[:-1]), parts[-1]
+
+
+def _upload_document(page, pdf_path):
+    """Reveal the uploader (if needed) and attach a PDF via the hidden input."""
+    t = CONFIG["step_timeout_ms"]; S = SELECTORS
+    if not page.locator(S["upload_input"]).count():
+        page.click(S["upload_reveal_btn"], timeout=t)
+        page.wait_for_timeout(800)
+    page.set_input_files(S["upload_input"], pdf_path, timeout=t)
+    page.wait_for_selector(f"text={_doc_display_name(pdf_path)}", timeout=t)
+
+
+def _add_uploaded_document(page, pdf_path):
+    """Add another uploaded PDF (e.g. the filled Rental Terms Summary) from the
+    editor via '+ Add Document(s)'."""
+    t = CONFIG["step_timeout_ms"]; S = SELECTORS
+    page.click(S["add_documents_btn"], timeout=t)
+    page.wait_for_timeout(800)
+    # Prefer an explicit upload option if the menu offers one; otherwise the
+    # hidden uploader input may already be present.
+    for lbl in ("Upload Document(s)", "Upload Document", "Upload"):
+        opt = page.get_by_text(lbl, exact=False)
+        if opt.count():
+            try:
+                opt.first.click(timeout=3000)
+                break
+            except Exception:
+                pass
+    page.wait_for_timeout(600)
+    page.set_input_files(S["upload_input"], pdf_path, timeout=t)
+    page.wait_for_selector(f"text={_doc_display_name(pdf_path)}", timeout=t)
+
+
+def _apply_overlay_to_lease(page, overlay_name):
+    """Apply the signature-field overlay onto the uploaded FILLED lease. Called
+    while the lease is the ONLY document, so there is exactly one document gear.
+
+    Two 'Select' clicks: the first picks the overlay from the list, which opens a
+    field-mapping dialog (Role Options: Tenant (1)/(2)/Landlord + All Fields, all
+    checked by default); the second confirms it. The overlay's roles become the
+    signing's participant roles."""
+    t = CONFIG["step_timeout_ms"]; S = SELECTORS
+    gear = page.locator(f"button:has({S['doc_gear_svg_path']})")
+    assert gear.count() == 1, (
+        f"expected exactly one document gear before applying the overlay, "
+        f"found {gear.count()} — apply the overlay before adding other documents")
+    gear.first.click(timeout=t)
+    page.wait_for_timeout(800)
+    page.click(S["apply_overlay_item"], timeout=t)
+    page.wait_for_timeout(1500)
+    page.get_by_text(overlay_name, exact=True).first.click(timeout=t)
+    page.wait_for_timeout(500)
+    page.locator(S["picker_select_btn"]).last.click(timeout=t)   # -> field-mapping dialog
+    # Confirm the mapping dialog (defaults: all roles + all fields).
+    page.wait_for_selector("text=Role Options", timeout=t)
+    page.locator(S["picker_select_btn"]).last.click(timeout=t)
+    page.wait_for_selector("text=Role Options", state="detached", timeout=t)
+    page.wait_for_timeout(1500)
+
+
+def _add_template_by_name(page, name):
+    """Add a premade packet template (its own document) by exact name."""
+    t = CONFIG["step_timeout_ms"]; S = SELECTORS
+    page.click(S["add_documents_btn"], timeout=t)
+    page.wait_for_timeout(800)
+    page.click(S["select_template_btn"], timeout=t)
+    page.wait_for_timeout(1500)
+    page.get_by_text(name, exact=True).first.click(timeout=t)
+    page.wait_for_timeout(500)
+    page.click(S["picker_select_btn"], timeout=t)
+    page.wait_for_timeout(2000)
+
+
+def _fill_participant_dialog(page, sr):
+    """Fill the open 'Edit Participant' modal: role (dropdown), first/last name,
+    email, type=Signer, then Save."""
+    t = CONFIG["step_timeout_ms"]; S = SELECTORS
+    first, last = _split_name(sr["name"])
+    page.wait_for_selector(S["participant_section"], timeout=t)
+    # Role is a dropdown of generic role types. Options render as e.g.
+    # "Tenant" or "Tenant (+Add new)" (a suffix appears once a contact exists),
+    # so match on the role as a prefix, not an exact string.
+    if sr.get("role"):
+        page.locator(S["participant_role"]).click(timeout=t)
+        page.wait_for_timeout(500)
+        role_re = re.compile(rf"^{re.escape(sr['role'])}(\b|\s|\(|$)")
+        opt = page.get_by_role("option", name=role_re)
+        if opt.count():
+            opt.first.click(timeout=5_000)
+        else:
+            page.locator(f"text=/^{re.escape(sr['role'])}( \\(\\+Add new\\))?$/").last.click(timeout=5_000)
+    page.fill(S["participant_first"], first, timeout=t)
+    page.fill(S["participant_last"], last, timeout=t)
+    if sr.get("email"):
+        page.fill(S["participant_email"], sr["email"], timeout=t)
+    # Ensure the participant is a Signer (not Reviewer/Distribution).
+    try:
+        page.locator(S["participant_type"]).get_by_text("Signer", exact=True).first.click(timeout=3_000)
+    except Exception:
+        pass
+    page.click(S["participant_save"], timeout=t)
+    page.wait_for_timeout(1200)
+    # When the email matches an existing SmartMLS contact, a "Do you want to
+    # merge the following contacts?" dialog appears. Keep them separate (No) so
+    # the automation never silently mutates Jay's saved contacts.
+    try:
+        if page.get_by_text("Do you want to merge", exact=False).count():
+            page.get_by_role("button", name="No", exact=True).first.click(timeout=5_000)
+            page.wait_for_timeout(1000)
+    except Exception:
+        pass
+    page.wait_for_timeout(800)
+
+
+def add_participants(page, signers):
+    """Assign each signer to a participant row. The overlay pre-creates one row
+    (edit it for the first signer); '+ Add Participant' opens a fresh modal for
+    each of the rest."""
+    t = CONFIG["step_timeout_ms"]; S = SELECTORS
+    for i, sr in enumerate(signers):
+        if i == 0 and page.locator(S["edit_participant_btn"]).count():
+            page.locator(S["edit_participant_btn"]).first.click(timeout=t)
+        else:
+            page.click(S["add_participant_btn"], timeout=t)
+        page.wait_for_timeout(1000)
+        _fill_participant_dialog(page, sr)
+
+
+# ----------------------------------------------------------------------
 # The signing routine
 # ----------------------------------------------------------------------
 def run_signing(page, job: dict, auditor: Auditor, state: dict):
@@ -415,108 +572,98 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         page.wait_for_selector(S["logged_in_marker"], timeout=t)
     step(auditor, "smartmls sign dashboard (session alive)", goto_app)
 
-    # 2. New signing, NAMED from the job (the name drives completion-email
-    #    correlation, so it must be set — never left as a template default)
-    def create_signing():
-        page.click(S["new_signing_btn"], timeout=t)
-        page.fill(S["signing_name_input"], job["signing_name"], timeout=t)
-        page.click(S["create_btn"], timeout=t)
-    step(auditor, "create signing", create_signing)
-
-    # 3. Upload the filled lease PDF (plus any static-PDF docs in documents).
-    #    Supporting docs that already exist as Smart Sign templates are ADDED
-    #    in step 5, not uploaded.
+    # 2. New signing: name it (drives completion-email correlation, so it must
+    #    be set), upload the FILLED lease, then Continue into the editor.
     documents = job.get("documents") or [job["pdf_path"]]
+    lease_pdf = job["pdf_path"]
 
-    def add_documents():
-        for doc in documents:
-            page.set_input_files(S["upload_input"], doc, timeout=t)
-            page.wait_for_selector(S["doc_uploaded_marker"], timeout=t)
-    step(auditor, f"upload {len(documents)} document(s)", add_documents)
+    def start_signing():
+        page.click(S["new_signing_btn"], timeout=t)
+        page.wait_for_selector(S["signing_name_input"], timeout=t)
+        page.fill(S["signing_name_input"], job["signing_name"], timeout=t)
+        _upload_document(page, lease_pdf)
+        page.click(S["continue_btn"], timeout=t)
+        page.wait_for_selector(S["add_documents_btn"], timeout=t)  # editor is up
+    step(auditor, "start signing + upload lease", start_signing)
 
-    # 4 + 5. Assemble the packet by adding templates ONE AT A TIME (Smart Sign
-    #        requires this): first the lease signature overlay, then each
-    #        supporting-doc template by name, in order.
-    def apply_template_by_name(tpl_name):
-        page.click(S["templates_btn"], timeout=t)
-        page.click(S["template_row"].format(template_name=tpl_name), timeout=t)
-        page.click(S["apply_template_btn"], timeout=t)
-        page.wait_for_selector(S["doc_uploaded_marker"], timeout=t)
-
+    # 3. Apply the signature overlay onto the filled lease. MUST happen before
+    #    any other document is added (so there's exactly one document gear).
     overlay = CONFIG["lease_overlay"].get(job.get("lease_type", ""))
 
-    def apply_lease_overlay():
+    def apply_overlay():
         assert overlay, f"no lease overlay configured for lease_type {job.get('lease_type')!r}"
-        apply_template_by_name(overlay)
-    step(auditor, "apply lease overlay", apply_lease_overlay)
+        _apply_overlay_to_lease(page, overlay)
+    step(auditor, f"apply overlay: {overlay}", apply_overlay)
+
+    # 4. Add the remaining uploaded documents (e.g. filled Rental Terms Summary).
+    for doc in documents[1:]:
+        step(auditor, f"add document: {Path(doc).name}",
+             (lambda d=doc: _add_uploaded_document(page, d)))
+
+    # 5. Add each premade packet template (its own document), one at a time.
     for tpl in CONFIG["packet_templates"]:
-        step(auditor, f"add template: {tpl}",
-             (lambda name=tpl: apply_template_by_name(name)))
+        step(auditor, f"add packet template: {tpl}",
+             (lambda name=tpl: _add_template_by_name(page, name)))
 
-    # 6. Add each signer — landlord person + tenant(s). Reuse an existing
-    #    SmartMLS Sign contact when the name already exists (so a repeat
-    #    landlord like Matt isn't re-entered); type a new contact in full only
-    #    when there's no match.
-    def add_one_signer(sr):
-        page.click(S["add_signer_btn"], timeout=t)
-        matched = False
-        if page.locator(S["contact_search"]).count():
-            page.fill(S["contact_search"], sr["name"], timeout=t)
-            result = page.locator(S["contact_result"].format(name=sr["name"]))
-            if result.count():
-                result.first.click(timeout=t)   # select the existing contact
-                matched = True
-        if not matched:
-            page.fill(S["signer_name"], sr["name"], timeout=t)
-            if sr.get("email"):
-                page.fill(S["signer_email"], sr["email"], timeout=t)
-        if page.locator(S["signer_role"]).count():
-            page.select_option(S["signer_role"], label=sr["role"])
-        page.click(S["signer_save"], timeout=t)
-
-    def add_signers():
-        for sr in all_signers(job):
-            add_one_signer(sr)
-    step(auditor, "add signers (landlord + tenants)", add_signers)
-
-    # 6b. Single tenant -> remove the overlay's unused 2nd-tenant role and its
-    #     fields, or SmartMLS Sign refuses to send (unassigned fields).
-    if len(signers_of(job)) < 2:
-        def remove_second_tenant():
-            page.click(S["remove_second_tenant"], timeout=t)
-        step(auditor, "remove unused 2nd tenant slot", remove_second_tenant)
+    # 6. Assign each signer to a participant — landlord person first, then
+    #    tenant(s). Two tenants map to the overlay's Tenant (1)/(2) by order.
+    step(auditor, "add participants (landlord + tenants)",
+         (lambda: add_participants(page, all_signers(job))))
 
     # 7. HARD CHECK — every approved signer email must appear on-screen exactly
-    #    (normalized, case-insensitive) and no OTHER email may appear.
+    #    (normalized, case-insensitive) and no OTHER email may appear. Emails
+    #    render inside the participant sections.
     def verify_recipients():
-        container = page.locator(S["review_email_text"])
-        container.wait_for(timeout=t)
-        text = container.inner_text()
+        # The Signing Flow rows show name+role but not the email, so read each
+        # participant's email back from its edit dialog (then Cancel — no change).
         approved = {s["email"].strip().lower() for s in all_signers(job) if s.get("email")}
-        # Exact token match, not a substring test: 'jsmith@x.com' must not be
-        # accepted because it is a substring of 'xjsmith@x.com'.
-        tokens = {tok.lower() for tok in re.findall(_EMAIL_SCRAPE, text)}
-        missing = approved - tokens
+        found = set()
+        edits = page.locator(S["edit_participant_btn"])
+        count = edits.count()
+        try:
+            for i in range(count):
+                edits.nth(i).click(timeout=t)
+                page.wait_for_selector(S["participant_email"], timeout=t)
+                val = page.locator(S["participant_email"]).first.input_value()
+                if val:
+                    found.add(val.strip().lower())
+                page.click(S["participant_cancel"], timeout=t)
+                page.wait_for_timeout(500)
+        except Exception as e:
+            # Couldn't read a participant back. On a real send this must block;
+            # during a --no-send dry run, warn and let the draft be eyeballed.
+            assert CONFIG.get("no_send"), f"could not verify recipients ({e})"
+            notify("info", f"DRY RUN — could not read back all recipient emails ({e})",
+                   job.get("signing_name", ""))
+            return
+        missing = approved - found
         assert not missing, (
-            f"Approved signer email(s) {sorted(missing)!r} not found on the "
-            f"review screen. Emails on screen: {sorted(tokens)!r}"
-        )
+            f"Approved signer email(s) {sorted(missing)!r} not found among the "
+            f"{count} participants. Emails found: {sorted(found)!r}")
         whitelist = {e.strip().lower() for e in CONFIG["signer_whitelist"]}
-        unexpected = tokens - approved - whitelist
-        assert not unexpected, f"Unexpected emails on review screen: {sorted(unexpected)!r}"
+        unexpected = found - approved - whitelist
+        assert not unexpected, f"Unexpected participant email(s): {sorted(unexpected)!r}"
     step(auditor, "verify recipients match approval", verify_recipients)
 
-    # 8. SEND — only reachable if every check above passed.
-    #    We flip state['sent_clicked'] the instant the click lands so the
-    #    caller can tell a pre-send abort from a post-send anomaly. The
-    #    guard also makes a retry re-wait for confirmation without ever
-    #    clicking Send a second time.
+    # 8. SEND — only reachable if every check above passed. --no-send stops here
+    #    (dry run: assemble + verify, leave as a draft to eyeball) so the first
+    #    live runs never actually send. We flip state['sent_clicked'] the instant
+    #    the click lands so the caller can tell a pre-send abort from a post-send
+    #    anomaly, and so a retry re-waits for confirmation without clicking twice.
+    if CONFIG.get("no_send"):
+        auditor.snap("STOP before send (--no-send)")
+        notify("info",
+               f"Assembled signing for {job['property']} and stopped BEFORE Send "
+               f"(--no-send). Left as a draft in SmartMLS Sign. Audit: {auditor.dir}",
+               job.get("signing_name", ""))
+        return
+
     def send():
         if not state["sent_clicked"]:
             page.click(S["send_btn"], timeout=t)
             state["sent_clicked"] = True
         page.wait_for_selector(S["sent_confirmation"], timeout=t)
-    step(auditor, "send signing invites", send)
+    step(auditor, "send signing", send)
 
 
 def process_job(job_path: Path):
@@ -557,6 +704,10 @@ def process_job(job_path: Path):
             sys.exit(1)
         ctx.close()
 
+    # Dry run: nothing was sent, so leave every file exactly where it is.
+    if CONFIG.get("no_send"):
+        return
+
     # File the paperwork: move PDF + job to Sent. If this fails the lease is
     # ALREADY sent, so we must not pretend it failed -- leave the job in
     # Sending, flag it, and let Jay file it by hand. Exit 3.
@@ -595,6 +746,12 @@ def setup_profile():
 
 
 if __name__ == "__main__":
+    # --no-send   : assemble + verify then STOP before Send (leaves a draft).
+    # --skip-packet: don't add the CONFIG['packet_templates'] (core-flow test).
+    if "--no-send" in sys.argv:
+        CONFIG["no_send"] = True
+    if "--skip-packet" in sys.argv:
+        CONFIG["packet_templates"] = []
     if "--setup" in sys.argv:
         setup_profile()
     elif "--job" in sys.argv:

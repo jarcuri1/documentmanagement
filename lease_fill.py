@@ -434,12 +434,18 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _LEASE_TYPES = {"single_family", "multi_family"}
 
 
+def _long_date(d):
+    """'September 1, 2026' — cross-platform (no %-d; that's glibc-only and
+    raises 'Invalid format string' on Windows)."""
+    return f"{d.strftime('%B')} {d.day}, {d.year}"
+
+
 def _fmt_date(v):
     if not v:
-        return date.today().strftime("%B %-d, %Y")
+        return _long_date(date.today())
     for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
         try:
-            return datetime.strptime(v, fmt).strftime("%B %-d, %Y")
+            return _long_date(datetime.strptime(v, fmt).date())
         except ValueError:
             pass
     return str(v)
