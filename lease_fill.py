@@ -359,13 +359,20 @@ _ANCHOR_TOLERANCE_PT = 2.0
 _blank_pdf_cache = {}
 
 
+# Every line the signature overlay pins a field near — NOT just "Initial". The
+# old check only watched "Initial" (page-footer) anchors, which never move even
+# when the tenant block shifts, so a name-insertion shift went undetected.
+_ANCHOR_NEEDLES = ("Initial", "Address:", "Social Security Number", "Signature")
+
+
 def _anchor_layout(pdf_path):
-    """(page_count, sorted [(page, y) for every 'Initial' anchor])."""
+    """(page_count, sorted [(needle, page, y)]) for every overlay-relevant line."""
     doc = fitz.open(str(pdf_path))
     anchors = []
     for i in range(doc.page_count):
-        for r in doc[i].search_for("Initial"):
-            anchors.append((i, round(r.y0, 1)))
+        for needle in _ANCHOR_NEEDLES:
+            for r in doc[i].search_for(needle):
+                anchors.append((needle, i, round(r.y0, 1)))
     n = doc.page_count
     doc.close()
     return n, sorted(anchors)
@@ -379,32 +386,79 @@ def _compare_layout(blank_pdf, filled_pdf):
             f"page count changed (blank {bn} -> filled {fn}): a filled value "
             f"reflowed the document, so the signature overlay would misalign. "
             f"Shorten the offending value.")
-    if len(ba) != len(fa) or any(bp != fp or abs(by - fy) > _ANCHOR_TOLERANCE_PT
-                                 for (bp, by), (fp, fy) in zip(ba, fa)):
+    if len(ba) != len(fa) or any(bneed != fneed or bp != fp or abs(by - fy) > _ANCHOR_TOLERANCE_PT
+                                 for (bneed, bp, by), (fneed, fp, fy) in zip(ba, fa)):
         raise LeaseFillError(
-            "an Initial/signature line moved relative to the blank template — "
-            "a filled value is too long and reflowed the page; the signature "
-            "overlay would misalign. Shorten the offending value.")
+            "a signature/fill-in line moved relative to the overlay reference — "
+            "a filled value is too long and reflowed the page (e.g. a tenant name "
+            "that wraps to two lines); the signature overlay would misalign. "
+            "Shorten the offending value.")
 
 
-def _blank_pdf_for(lease_type):
+# Canonical intake used to render the overlay REFERENCE lease. The overlays in
+# SmartMLS Sign must be built on THIS filled PDF (see build_overlay_references()),
+# not the blank template — filling adds a one-line tenant name per slot, so a
+# blank-built overlay would sit ~1 line per tenant too high. Every real lease
+# with single-line names matches this layout; a name that wraps to two lines is
+# caught by verify_layout_locked and fails closed.
+_REF_INTAKE = {
+    "single_family": {
+        "lease_type": "single_family", "landlord": "Reference Landlord LLC",
+        "landlord_signer": {"name": "Reference Signer", "email": "ref@example.com"},
+        "property": "1 Reference Street, Waterbury CT",
+        "premises_address": "1 Reference Street, Waterbury, CT 06704",
+        "term_start": "2026-01-01", "term_end": "2026-12-31",
+        "rent": "1000", "deposit": "1000",
+        "utilities": {"water": "City", "wastewater": "Sewer", "fuel": "Gas"},
+        "tenants": [{"name": "Reference Tenant One", "email": "ref1@example.com"},
+                    {"name": "Reference Tenant Two", "email": "ref2@example.com"}],
+    },
+    "multi_family": {
+        "lease_type": "multi_family", "landlord": "Reference Landlord LLC",
+        "landlord_signer": {"name": "Reference Signer", "email": "ref@example.com"},
+        "property": "1 Reference Street, Waterbury CT",
+        "premises_address": "1 Reference Street, Waterbury, CT 06704",
+        "term_start": "2026-01-01", "term_end": "2026-12-31",
+        "rent": "1000", "deposit": "1000",
+        "tenants": [{"name": "Reference Tenant One", "email": "ref1@example.com"},
+                    {"name": "Reference Tenant Two", "email": "ref2@example.com"}],
+    },
+}
+
+
+def _reference_pdf_for(lease_type, out_dir=None):
+    """Render (and cache) the canonical FILLED reference lease for a type. This
+    is the layout the SmartMLS Sign overlay must be built on."""
     tpl = CONFIG["templates"][lease_type]
-    key = (str(tpl), tpl.stat().st_mtime)
-    cached = _blank_pdf_cache.get(key)
-    if cached and Path(cached).exists():
-        return cached
-    cache_dir = Path(tempfile.gettempdir()) / "lease_blank_pdf"
+    key = (str(tpl), tpl.stat().st_mtime, lease_type)
+    if out_dir is None:
+        cached = _blank_pdf_cache.get(key)
+        if cached and Path(cached).exists():
+            return cached
+    cache_dir = Path(out_dir) if out_dir else (Path(tempfile.gettempdir()) / "lease_overlay_ref")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    produced = _docx_to_pdf(tpl, cache_dir)          # the UNFILLED template
-    dest = cache_dir / f"{lease_type}.pdf"
+    data = normalize_intake(_REF_INTAKE[lease_type])
+    doc = _fill_document(data)
+    tmp_docx = cache_dir / f"{lease_type}_overlay_reference.docx"
+    doc.save(str(tmp_docx))
+    produced = _docx_to_pdf(tmp_docx, cache_dir)
+    dest = cache_dir / f"{lease_type}_overlay_reference.pdf"
     if produced.resolve() != dest.resolve():
         produced.replace(dest)
-    _blank_pdf_cache[key] = str(dest)
+    tmp_docx.unlink(missing_ok=True)
+    if out_dir is None:
+        _blank_pdf_cache[key] = str(dest)
     return str(dest)
 
 
+def build_overlay_references(out_dir):
+    """Write both overlay-reference PDFs to out_dir (for rebuilding the SmartMLS
+    Sign overlays on). Run: python lease_fill.py --overlay-refs <dir>."""
+    return {lt: _reference_pdf_for(lt, out_dir=out_dir) for lt in sorted(_LEASE_TYPES)}
+
+
 def verify_layout_locked(filled_pdf, lease_type):
-    _compare_layout(_blank_pdf_for(lease_type), filled_pdf)
+    _compare_layout(_reference_pdf_for(lease_type), filled_pdf)
 
 
 def fill_lease_pdf(data, out_pdf):
@@ -693,8 +747,13 @@ if __name__ == "__main__":
     ap.add_argument("--watch", action="store_true", help="watch the intake folder forever")
     ap.add_argument("--drain", action="store_true", help="process the intake folder once, then exit (supervisor mode)")
     ap.add_argument("--dry-run", action="store_true", help="with --intake: build PDF only, queue nothing")
+    ap.add_argument("--overlay-refs", metavar="DIR",
+                    help="render the canonical overlay-reference PDFs to DIR (rebuild the SmartMLS Sign overlays on these)")
     args = ap.parse_args()
-    if args.watch:
+    if args.overlay_refs:
+        for lt, path in build_overlay_references(args.overlay_refs).items():
+            print(f"{lt}: {path}")
+    elif args.watch:
         watch_intake()
     elif args.drain:
         drain_intake()
