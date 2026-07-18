@@ -522,6 +522,7 @@ def build_job(data, pdf_path, documents=None):
     # The full signing packet: the filled lease first, then the static docs.
     docs = documents if documents is not None else [str(pdf_path)]
     return {
+        "lease_type": data["lease_type"],    # which SmartMLS Sign overlay the sender applies
         "property": data["property"],
         "signing_name": f"Lease - {data['property']} - {surname}",
         "signers": signers,

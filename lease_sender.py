@@ -89,7 +89,13 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # ----------------------------------------------------------------------
 CONFIG = {
     "sign_url": "https://signings.smartmls.propkit.io/signings",  # SmartMLS Sign app
-    "template_name": "Residential Lease",   # exact name of the LEASE signature overlay (Templates > Forms)
+    # Exact SmartMLS Sign template (overlay) name per lease type — must match
+    # the template names in Templates (Forms) character-for-character. Name your
+    # templates exactly these:
+    "lease_overlay": {
+        "single_family": "Agent automated single_family_lease",
+        "multi_family":  "Agent automated multi_family_lease",
+    },
     # The other packet documents already exist as SmartMLS Sign templates with
     # their signature/initial spots. A signing is built by adding templates ONE
     # AT A TIME, so list their exact names here, in the order they should be
@@ -322,8 +328,12 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         page.click(S["apply_template_btn"], timeout=t)
         page.wait_for_selector(S["doc_uploaded_marker"], timeout=t)
 
-    step(auditor, "apply lease overlay",
-         lambda: apply_template_by_name(CONFIG["template_name"]))
+    overlay = CONFIG["lease_overlay"].get(job.get("lease_type", ""))
+
+    def apply_lease_overlay():
+        assert overlay, f"no lease overlay configured for lease_type {job.get('lease_type')!r}"
+        apply_template_by_name(overlay)
+    step(auditor, "apply lease overlay", apply_lease_overlay)
     for tpl in CONFIG["packet_templates"]:
         step(auditor, f"add template: {tpl}",
              (lambda name=tpl: apply_template_by_name(name)))
