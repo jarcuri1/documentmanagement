@@ -62,11 +62,13 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import docx
+import fitz  # PyMuPDF — used to verify the filled layout didn't shift
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
@@ -331,8 +333,70 @@ def _docx_to_pdf(docx_path, out_dir):
     return pdf
 
 
+# ----------------------------------------------------------------------
+# Layout lock — GUARANTEE the fill didn't move the signature/initial lines.
+# The e-sign overlay pins signature/initial/date boxes to fixed page
+# positions; if a filled value were long enough to wrap and push content
+# down, those boxes would land in the wrong place. So after filling we
+# compare the result against the blank template: same page count, and every
+# "Initial" anchor within a hair of where it sits on the blank. Any drift =>
+# fail-closed abort. A misaligned signing never goes out.
+# ----------------------------------------------------------------------
+_ANCHOR_TOLERANCE_PT = 2.0
+_blank_pdf_cache = {}
+
+
+def _anchor_layout(pdf_path):
+    """(page_count, sorted [(page, y) for every 'Initial' anchor])."""
+    doc = fitz.open(str(pdf_path))
+    anchors = []
+    for i in range(doc.page_count):
+        for r in doc[i].search_for("Initial"):
+            anchors.append((i, round(r.y0, 1)))
+    n = doc.page_count
+    doc.close()
+    return n, sorted(anchors)
+
+
+def _compare_layout(blank_pdf, filled_pdf):
+    bn, ba = _anchor_layout(blank_pdf)
+    fn, fa = _anchor_layout(filled_pdf)
+    if bn != fn:
+        raise LeaseFillError(
+            f"page count changed (blank {bn} -> filled {fn}): a filled value "
+            f"reflowed the document, so the signature overlay would misalign. "
+            f"Shorten the offending value.")
+    if len(ba) != len(fa) or any(bp != fp or abs(by - fy) > _ANCHOR_TOLERANCE_PT
+                                 for (bp, by), (fp, fy) in zip(ba, fa)):
+        raise LeaseFillError(
+            "an Initial/signature line moved relative to the blank template — "
+            "a filled value is too long and reflowed the page; the signature "
+            "overlay would misalign. Shorten the offending value.")
+
+
+def _blank_pdf_for(lease_type):
+    tpl = CONFIG["templates"][lease_type]
+    key = (str(tpl), tpl.stat().st_mtime)
+    cached = _blank_pdf_cache.get(key)
+    if cached and Path(cached).exists():
+        return cached
+    cache_dir = Path(tempfile.gettempdir()) / "lease_blank_pdf"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    produced = _docx_to_pdf(tpl, cache_dir)          # the UNFILLED template
+    dest = cache_dir / f"{lease_type}.pdf"
+    if produced.resolve() != dest.resolve():
+        produced.replace(dest)
+    _blank_pdf_cache[key] = str(dest)
+    return str(dest)
+
+
+def verify_layout_locked(filled_pdf, lease_type):
+    _compare_layout(_blank_pdf_for(lease_type), filled_pdf)
+
+
 def fill_lease_pdf(data, out_pdf):
-    """Fill the template and render it to out_pdf. Returns out_pdf."""
+    """Fill the template, render to out_pdf, and VERIFY the layout didn't move
+    (so the signature overlay stays aligned). Returns out_pdf."""
     out_pdf = Path(out_pdf)
     doc = _fill_document(data)
     tmp_docx = out_pdf.with_suffix(".docx")
@@ -341,6 +405,10 @@ def fill_lease_pdf(data, out_pdf):
         produced = _docx_to_pdf(tmp_docx, out_pdf.parent)
         if produced.resolve() != out_pdf.resolve():
             produced.replace(out_pdf)
+        verify_layout_locked(out_pdf, data["lease_type"])
+    except Exception:
+        Path(out_pdf).unlink(missing_ok=True)   # never leave a bad/misaligned PDF
+        raise
     finally:
         tmp_docx.unlink(missing_ok=True)
     return out_pdf
