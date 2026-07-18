@@ -497,10 +497,28 @@ def _add_template_by_name(page, name):
     page.wait_for_timeout(800)
     page.click(S["select_template_btn"], timeout=t)
     page.wait_for_timeout(1500)
+    # Adding a 2nd+ template pops a "Multiple Template Warning" (Signing Flow
+    # formatting is reset) BEFORE the picker opens. Acknowledge it — the sender
+    # reconciles participants after all documents are in.
+    try:
+        if page.get_by_text("Multiple Template Warning", exact=False).count():
+            page.get_by_role("button", name="Proceed", exact=True).first.click(timeout=5_000)
+            page.wait_for_timeout(1500)
+    except Exception:
+        pass
     page.get_by_text(name, exact=True).first.click(timeout=t)
     page.wait_for_timeout(500)
     page.click(S["picker_select_btn"], timeout=t)
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(1500)
+    # Some template adds confirm via a generic prompt (dialog-prompt-ok-btn).
+    try:
+        ok = page.locator("[data-testid='dialog-prompt-ok-btn']")
+        if ok.count() and not page.locator(S["participant_section"]).count():
+            ok.first.click(timeout=4_000)
+            page.wait_for_timeout(1500)
+    except Exception:
+        pass
+    page.wait_for_timeout(1000)
 
 
 def _fill_participant_dialog(page, sr):

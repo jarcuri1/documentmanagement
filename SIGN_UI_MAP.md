@@ -70,6 +70,24 @@ signing's participant roles. Confirmed by a real end-to-end send (2026-07-18).
   the send only commits after this is answered. Success = the invite email
   ("eSigning Invitation | <signing name>") arrives from smartmls@propkit.io.
 
-## Test artifacts to clean up (drafts I created while mapping)
-Signings named `ZZ SELECTOR TEST - delete me` / `SELECTOR TEST` and draft id
-50604. Signing 50600 is the (sent) test from Jay's codegen walkthrough.
+## Packet templates — BLOCKED on template roles (Jay's GUI task)
+Verified live: adding a 2nd+ template pops a "Multiple Template Warning"
+(Signing Flow formatting resets; roles collapse to Stage 1 / order Any) with a
+**Proceed** button — the sender handles it. But the packet templates carry their
+OWN roles which merge into the signing: `1_Wiring Fraud Advisory Notice - eXp
+Connecticut` injects **Landlord (1), Landlord (2), Seller (1), Seller (2)** (it
+was built for sales). For leases every packet template must use the SAME role
+trio as the overlays — **Tenant (1), Tenant (2), Landlord** — so the roles merge
+instead of demanding Seller signers. Fix each template's roles in Sign >
+Templates (Forms), then re-test with:
+  python lease_sender.py --job <job.json> --no-send
+(protectyourfamily pamphlet added no roles; the two Disclosure templates were
+never reached — verify their roles too.)
+
+## Test artifacts to clean up (drafts created while mapping)
+Sign > Drafts: 6x "Lease - 123 Test St, 1st Floor, Waterbury CT - One" +
+"ZZ PACKET PROBE / SELECTOR TEST / OVERLAY TEST / PARTICIPANT TEST - delete me"
+(pages 1-3). In Progress: withdraw "33 George St test" (Jay's codegen test) and
+the sent test signing "Lease - 123 Test St, 1st Floor, Waterbury CT - One".
+Leave "Lucille" and "57 New ST Angel" alone — REAL signings. Test contacts:
+Matthew Como / Test Tenant One / Test Tenant Two in Contacts.
