@@ -1,0 +1,286 @@
+"""
+LeaseSignedWatcher — retrieve executed leases from email and file them
+======================================================================
+Part 3 (final piece) of the signed-lease filing feature. Watches the Gmail
+inbox for SmartMLS Sign completion emails, pulls the executed lease PDF out
+of the attachments, correlates it back to the job that sent it, and hands it
+to lease_filer.file_signed_lease (which files it into the right Dropbox
+folder and retires the old one).
+
+HOW IT PLUGS IN
+  * Reuses the Email Agent's Gmail OAuth token (token_premio.json +
+    credentials.json in the EmailAgent dir) — no second login, and this
+    script never modifies the Email Agent.
+  * Dedupes by Gmail message id in its own state file, and searches ALL mail
+    (not just unread/inbox), so it works regardless of what the Email Agent
+    does to the message (archive to a label, mark read, etc.). No races.
+  * Runs on a schedule (add to the supervisor fleet, or cron) like the other
+    agents.
+
+THE EMAIL (from the screenshots)
+  From:    SmartMLS Sign
+  Subject: eSigning Completed | <signing name>
+  Body:    "...fully executed documents are attached..."
+  Attach:  the executed lease PDF + CT disclosures + a signing Certificate.
+
+CORRELATION (which job is this?)
+  Our sender names every signing "Lease - <property> - <surname>", and Smart
+  Sign echoes that into the subject after "| ". So the primary match is:
+  subject name == a Sent job's signing_name. Fallback: read the property and
+  tenant surnames out of the executed PDF and match a Sent job that way. If
+  nothing matches, the PDF goes to Leases\\Signed\\_unfiled\\ with a push —
+  never guessed into a folder.
+
+RUN (fleet PC, after the Email Agent has authenticated once):
+  python lease_signed_watcher.py           # process new completions, exit
+  python lease_signed_watcher.py --loop    # poll forever
+  python lease_signed_watcher.py --dry-run # match + report; download nothing,
+                                           # file nothing, mark nothing
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+_SHARED_ROOT = os.environ.get("LEASE_SHARED_ROOT", r"C:\AIAgents\shared")
+_LEASES_ROOT = os.environ.get("LEASE_DROPBOX_ROOT", r"D:\Dropbox\Dropbox\Leases")
+
+CONFIG = {
+    # Where the Email Agent keeps its Google OAuth files (reused read-only).
+    "email_agent_dir": Path(os.environ.get("LEASE_EMAIL_AGENT_DIR", r"C:\AIAgents\EmailAgent")),
+    "token_file": os.environ.get("LEASE_GMAIL_TOKEN", "token_premio.json"),
+    "gmail_query": os.environ.get("LEASE_GMAIL_QUERY", 'subject:"eSigning Completed" newer_than:30d'),
+    "sent_dir": Path(os.environ.get("LEASE_SENT_DIR", str(Path(_LEASES_ROOT) / "Sent"))),
+    "unfiled_dir": Path(os.environ.get("LEASE_UNFILED_DIR", str(Path(_LEASES_ROOT) / "Signed" / "_unfiled"))),
+    "work_dir": Path(os.environ.get("LEASE_SIGNED_WORK", str(Path(_LEASES_ROOT) / "Signed" / "_incoming"))),
+    "state_file": Path(os.environ.get("LEASE_SIGNED_STATE",
+                       str(Path(r"C:\AIAgents\LeaseAgent\state") / "signed_processed.json"))),
+    "push_outbox_dir": Path(os.environ.get("LEASE_PUSH_OUTBOX", str(Path(_SHARED_ROOT) / "push_outbox"))),
+    "poll_seconds": int(os.environ.get("LEASE_SIGNED_POLL", "300")),
+}
+
+_GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+# Attachment names that are NOT the lease we file (disclosures + certificate).
+_NOT_LEASE = ("certificate", "disclosure", "protect", "standardized", "lead", "addendum", "cover")
+
+
+# ----------------------------------------------------------------------
+# Pure, testable core
+# ----------------------------------------------------------------------
+def _norm(s):
+    return re.sub(r"\s+", " ", str(s or "").strip().lower())
+
+
+def signing_name_from_subject(subject):
+    """'eSigning Completed | Lease - 61 Cliff... - Smith' -> the part after '|'."""
+    if "|" in subject:
+        return subject.split("|", 1)[1].strip()
+    return re.sub(r"(?i)^\s*esigning completed\s*[-:]?\s*", "", subject).strip()
+
+
+def pick_executed_lease(attachments):
+    """Choose the executed lease PDF from the attachment set. Prefers a PDF
+    whose name contains 'lease' and not a disclosure/certificate word; breaks
+    ties by size (the full executed doc is the largest). Returns the chosen
+    attachment dict or None if none can be confidently identified."""
+    pdfs = [a for a in attachments if str(a.get("filename", "")).lower().endswith(".pdf")]
+    if not pdfs:
+        return None
+
+    def score(a):
+        n = a["filename"].lower()
+        s = 0.0
+        if "lease" in n:
+            s += 100
+        if any(x in n for x in _NOT_LEASE):
+            s -= 200
+        s += (a.get("size", 0) or 0) / 1e6
+        return s
+
+    best = max(pdfs, key=score)
+    n = best["filename"].lower()
+    if "lease" not in n and any(x in n for x in _NOT_LEASE):
+        return None   # only disclosures/cert present — can't identify the lease
+    return best
+
+
+def correlate_job(signing_name, sent_dir, pdf_text=""):
+    """Find the Sent job this completion belongs to. Primary: subject name ==
+    job signing_name. Fallback: every signer surname + the property's leading
+    street number both appear in the executed PDF text. Returns (job, path) or
+    (None, None)."""
+    target = _norm(signing_name)
+    jobs = []
+    for jf in Path(sent_dir).glob("*.json"):
+        try:
+            jobs.append((json.loads(jf.read_text(encoding="utf-8")), jf))
+        except Exception:
+            continue
+
+    for job, jf in jobs:
+        if target and _norm(job.get("signing_name", "")) == target:
+            return job, jf
+
+    if pdf_text:
+        text = pdf_text.lower()
+        for job, jf in jobs:
+            signers = job.get("signers") or ([{"name": job.get("tenant_name", "")}]
+                                             if job.get("tenant_name") else [])
+            surnames = [str(s.get("name", "")).split()[-1].lower() for s in signers if s.get("name")]
+            num = re.match(r"\s*(\d+)", str(job.get("property", "")))
+            if surnames and all(sn in text for sn in surnames) and (not num or num.group(1) in text):
+                return job, jf
+    return None, None
+
+
+# ----------------------------------------------------------------------
+# Notifications / state
+# ----------------------------------------------------------------------
+_push_seq = 0
+
+
+def push(title, body, data=None):
+    global _push_seq
+    _push_seq += 1
+    outbox = CONFIG["push_outbox_dir"]
+    outbox.mkdir(parents=True, exist_ok=True)
+    payload = {"title": title, "body": body, "data": {**(data or {}), "kind": "lease"}}
+    name = f"lease-{os.getpid()}-{int(time.time() * 1000)}-{_push_seq}.json"
+    tmp = outbox / (name + ".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(outbox / name)
+
+
+def _load_processed():
+    try:
+        return set(json.loads(CONFIG["state_file"].read_text(encoding="utf-8")).get("ids", []))
+    except Exception:
+        return set()
+
+
+def _save_processed(ids):
+    CONFIG["state_file"].parent.mkdir(parents=True, exist_ok=True)
+    CONFIG["state_file"].write_text(json.dumps({"ids": sorted(ids)}), encoding="utf-8")
+
+
+# ----------------------------------------------------------------------
+# Gmail (lazy imports so the pure core is testable without google libs)
+# ----------------------------------------------------------------------
+def _gmail_service():
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+    token = CONFIG["email_agent_dir"] / CONFIG["token_file"]
+    if not token.exists():
+        raise RuntimeError(f"Gmail token not found: {token} (has the Email Agent authenticated?)")
+    creds = Credentials.from_authorized_user_file(str(token), _GMAIL_SCOPES)
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        token.write_text(creds.to_json())
+    return build("gmail", "v1", credentials=creds)
+
+
+def _iter_attachments(payload):
+    fn = payload.get("filename")
+    body = payload.get("body", {}) or {}
+    if fn and body.get("attachmentId"):
+        yield {"filename": fn, "size": body.get("size", 0), "attachmentId": body["attachmentId"]}
+    for part in payload.get("parts", []) or []:
+        yield from _iter_attachments(part)
+
+
+def _download_attachment(service, msg_id, att):
+    import base64
+    a = service.users().messages().attachments().get(
+        userId="me", messageId=msg_id, id=att["attachmentId"]).execute()
+    return base64.urlsafe_b64decode(a["data"])
+
+
+def _pdf_text(pdf_path):
+    try:
+        import fitz
+        doc = fitz.open(str(pdf_path))
+        return "\n".join(pg.get_text() for pg in doc[:3])
+    except Exception:
+        return ""
+
+
+def process_once(dry_run=False):
+    from lease_filer import file_signed_lease
+    service = _gmail_service()
+    processed = _load_processed()
+    listed = service.users().messages().list(userId="me", q=CONFIG["gmail_query"], maxResults=25).execute()
+    msgs = listed.get("messages", [])
+    handled = 0
+    for m in msgs:
+        mid = m["id"]
+        if mid in processed:
+            continue
+        full = service.users().messages().get(userId="me", id=mid, format="full").execute()
+        headers = {h["name"].lower(): h["value"] for h in full["payload"].get("headers", [])}
+        subject = headers.get("subject", "")
+        sender = headers.get("from", "")
+        # sanity: must look like a SmartMLS Sign completion
+        if "esigning completed" not in subject.lower():
+            continue
+        name = signing_name_from_subject(subject)
+        atts = list(_iter_attachments(full["payload"]))
+        lease_att = pick_executed_lease(atts)
+
+        if dry_run:
+            job, _ = correlate_job(name, CONFIG["sent_dir"])
+            print(f"[DRY-RUN] {subject!r} -> name={name!r} "
+                  f"attach={lease_att['filename'] if lease_att else None} "
+                  f"job={'MATCH' if job else 'no-match(name); PDF fallback at run time'}")
+            continue
+
+        if not lease_att:
+            push("Signed lease needs filing",
+                 f"'{name}' completed but no lease PDF found among attachments — file by hand.",
+                 {"name": name})
+            processed.add(mid)
+            continue
+
+        CONFIG["work_dir"].mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG["work_dir"] / f"{mid}-{re.sub(r'[^A-Za-z0-9._-]+', '_', lease_att['filename'])}"
+        tmp.write_bytes(_download_attachment(service, mid, lease_att))
+
+        job, jf = correlate_job(name, CONFIG["sent_dir"], pdf_text=_pdf_text(tmp))
+        if not job:
+            CONFIG["unfiled_dir"].mkdir(parents=True, exist_ok=True)
+            dest = CONFIG["unfiled_dir"] / lease_att["filename"]
+            if dest.exists():
+                dest = dest.with_name(f"{dest.stem}-{int(time.time())}{dest.suffix}")
+            tmp.replace(dest)
+            push("Signed lease needs filing",
+                 f"Couldn't match '{name}' to a sent job — left in _unfiled.", {"name": name})
+        else:
+            file_signed_lease(tmp, job, job_path=str(jf))   # files it + retires old + pushes
+
+        processed.add(mid)
+        handled += 1
+
+    _save_processed(processed)
+    return handled
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--loop", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    if args.loop:
+        while True:
+            try:
+                process_once(dry_run=args.dry_run)
+            except Exception as e:
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] error (continuing): {e}",
+                      file=sys.stderr)
+            time.sleep(CONFIG["poll_seconds"])
+    else:
+        process_once(dry_run=args.dry_run)
