@@ -82,7 +82,16 @@ def interview():
     print("\n=== New lease ===\n")
     lease_type = "single_family" if ask_choice("Lease type", ["single-family", "multi-family"]) == "single-family" else "multi_family"
 
-    landlord = ask("Landlord", default=DEFAULT_LANDLORD)
+    # Prints on the lease's "Landlord:" line = the owner LLC (or the owner's
+    # name if the property has no LLC). Once the Google Sheet is wired this
+    # auto-resolves from the property; for now you enter it.
+    landlord = ask("Owner LLC — prints as 'Landlord' on the lease (owner's name if no LLC)",
+                   default=DEFAULT_LANDLORD)
+    print("-- Landlord signer (the PERSON who signs for the owner) --")
+    landlord_signer = {
+        "name": ask("Landlord signer full name"),
+        "email": ask("Landlord signer email", validate=_valid_email),
+    }
     prop = ask("Property (full, e.g. '61 Cliff St, 2nd Floor, Naugatuck CT')")
     premises = ask("Premises address as it should print on the lease", default=prop)
     key_default = _slug(re.split(r",", prop)[0])
@@ -122,7 +131,8 @@ def interview():
 
     return {
         "lease_type": lease_type,
-        "landlord": landlord,
+        "landlord": landlord,               # owner LLC -> prints on the Landlord line
+        "landlord_signer": landlord_signer,  # person who signs (Sign fills their name)
         "property": prop,
         "premises_address": premises,
         "property_key": property_key,

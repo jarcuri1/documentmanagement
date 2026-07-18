@@ -475,7 +475,8 @@ def normalize_intake(raw):
         raise LeaseFillError(f"intake missing fields: {missing}")
     return {
         "lease_type": lease_type,
-        "landlord": raw["landlord"],
+        "landlord": raw["landlord"],                       # owner LLC -> Landlord line
+        "landlord_signer": raw.get("landlord_signer", {}),  # person who signs
         "property": raw["property"],
         "premises_address": raw["premises_address"],
         "agreement_date": _fmt_date(raw.get("agreement_date")),
@@ -521,7 +522,8 @@ def build_job(data, pdf_path, documents=None):
     surname = data["tenants"][0]["name"].split()[-1]
     # The full signing packet: the filled lease first, then the static docs.
     docs = documents if documents is not None else [str(pdf_path)]
-    return {
+    ls = data.get("landlord_signer") or {}
+    job = {
         "lease_type": data["lease_type"],    # which SmartMLS Sign overlay the sender applies
         "property": data["property"],
         "signing_name": f"Lease - {data['property']} - {surname}",
@@ -536,6 +538,9 @@ def build_job(data, pdf_path, documents=None):
         "filing_address": data.get("filing_address") or data["property"].split(",")[0].strip(),
         "term_start_iso": data.get("term_start_iso", ""),
     }
+    if ls.get("name") and ls.get("email"):
+        job["landlord_signer"] = {"name": ls["name"], "email": ls["email"]}
+    return job
 
 
 # ----------------------------------------------------------------------
