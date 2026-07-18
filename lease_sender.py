@@ -129,9 +129,10 @@ CONFIG = {
 # This dict is the single source of truth; nothing else hardcodes selectors.
 # ----------------------------------------------------------------------
 SELECTORS = {
-    # SmartMLS Sign — Signings dashboard
-    "logged_in_marker":     "text=New Signing",            # proves the SSO session is alive
-    "signin_with_mls_btn":  "button:has-text('Sign in with Smart MLS')",  # propkit landing page
+    # SmartMLS Sign — Signings dashboard. The create button (a stable test-id)
+    # is our proof the app is loaded and the session is alive.
+    "logged_in_marker":     "[data-testid='signings-create-btn']",
+    "signin_with_mls_btn":  "button:has-text('Sign in with Smart MLS')",  # propkit /auth landing
 
     # SmartMLS SSO (Keycloak realm 'connectmls') login form. Captured from the
     # real page. Used ONLY for unattended re-login when the persisted session
@@ -239,23 +240,59 @@ def get_credentials():
         return None, None
 
 
+def _wait_any(page, selectors, timeout_ms):
+    """Poll for any of several selectors; return the first that appears, or None
+    on timeout. Used because the login flow can land on several surfaces (app
+    dashboard vs. Keycloak form) and we don't know which up front."""
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        for sel in selectors:
+            try:
+                if page.locator(sel).count():
+                    return sel
+            except Exception:
+                pass
+        page.wait_for_timeout(500)
+    return None
+
+
 def login_if_needed(page):
-    """Ensure the SSO session is live. If it has lapsed, log back in from the
-    stored credentials, checking 'Remember me' so device trust persists and MFA
-    stays suppressed. Raises (via assert / PWTimeout, handled by step()) with a
-    clear, human-actionable message when a person is genuinely required."""
+    """Ensure the app is loaded and logged in, whatever surface we land on:
+
+      A) Fresh session  -> /signings shows the dashboard directly.
+      B) App token stale, SSO cookie good -> bounced to /auth; clicking
+         'Sign in with Smart MLS' silently returns to the dashboard.
+      C) SSO cookie expired -> that click lands on the Keycloak form; we fill
+         the stored credentials, tick 'Remember me' (device trust so MFA stays
+         suppressed), and submit.
+
+    Aborts (via assert, handled by step()) with a human-actionable message only
+    when a person is genuinely required (no stored creds, or MFA demanded)."""
     t = CONFIG["step_timeout_ms"]
     S = SELECTORS
-    # Already on the dashboard? The persisted session is still good.
-    try:
-        page.wait_for_selector(S["logged_in_marker"], timeout=5_000)
+    dash, user = S["logged_in_marker"], S["sso_username"]
+
+    # Case A: already in?
+    if _wait_any(page, [dash], 5_000):
         return
-    except PWTimeout:
-        pass
-    # Not logged in. Get to the Keycloak form (propkit landing has a button).
-    if page.locator(S["signin_with_mls_btn"]).count():
-        page.click(S["signin_with_mls_btn"], timeout=t)
-    page.wait_for_selector(S["sso_username"], timeout=t)  # PWTimeout -> step() aborts
+
+    # Get onto a login surface: click the propkit /auth button once it renders.
+    if _wait_any(page, [S["signin_with_mls_btn"]], 10_000):
+        try:
+            page.click(S["signin_with_mls_btn"], timeout=t)
+        except Exception:
+            pass
+
+    # Now either the dashboard comes back (Case B, silent SSO) or Keycloak
+    # asks for credentials (Case C).
+    landed = _wait_any(page, [dash, user], t)
+    assert landed, ("Could not reach the SmartMLS Sign dashboard or a login "
+                    "form after clicking 'Sign in with Smart MLS'. The app may "
+                    "be down or the flow changed.")
+    if landed == dash:
+        return  # Case B — silent SSO refresh worked
+
+    # Case C — full Keycloak login from stored credentials.
     username, password = get_credentials()
     assert username and password, (
         "SmartMLS session expired and no stored credentials were found. Run "
@@ -269,16 +306,12 @@ def login_if_needed(page):
         except Exception:
             pass  # non-fatal; login still proceeds
     page.click(S["sso_submit"], timeout=t)
-    # Success = dashboard reappears. If MFA is demanded instead, device trust
-    # has lapsed and only a human can restore it — abort loudly, don't hang.
-    try:
-        page.wait_for_selector(S["logged_in_marker"], timeout=t)
-    except PWTimeout:
-        assert not page.locator(S["sso_mfa_marker"]).count(), (
-            "SmartMLS demanded MFA during unattended login — device trust has "
-            "lapsed. Run `python lease_sender.py --setup` at the PC and check "
-            "'Remember me' to restore hands-free login.")
-        raise  # genuine timeout: let step() screenshot + abort
+    # Success = dashboard appears. MFA prompt instead => device trust lapsed.
+    after = _wait_any(page, [dash, S["sso_mfa_marker"]], t)
+    assert after and after == dash, (
+        "SmartMLS demanded MFA during unattended login (or the dashboard never "
+        "loaded) — device trust has lapsed. Run `python lease_sender.py --setup` "
+        "at the PC and check 'Remember me' to restore hands-free login.")
 
 
 class Auditor:
