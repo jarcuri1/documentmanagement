@@ -39,10 +39,12 @@ ONE-TIME SETUP (do this while at the PC):
      app. Click "Sign in with Smart MLS", complete the SmartMLS login (+ any
      MFA), land on the Signings dashboard, then close the window. Cookies
      persist in BROWSER_PROFILE_DIR.
-  3. In SmartMLS Sign -> Templates (Forms), build a signature-field template
-     for the lease (signature / initial / date blocks pre-placed) and put
-     its exact name in CONFIG["template_name"]. (If you place fields by hand
-     instead, adjust the apply-template step.)
+  3. In SmartMLS Sign -> Templates (Forms), build the lease signature overlays
+     (signature / initial / date + tenant fillable blocks) named EXACTLY as in
+     CONFIG["lease_overlay"] — one per lease type. Build each supporting-doc
+     template (lead disclosure, pamphlet, overview) and list their names in
+     CONFIG["packet_templates"]. A signing is assembled by adding these
+     templates one at a time.
   4. Capture real selectors: the app's DOM will not match my placeholders.
      Run:
        playwright codegen --user-data-dir="<BROWSER_PROFILE_DIR>" https://signings.smartmls.propkit.io/signings
