@@ -29,7 +29,7 @@ _FOLDERS_JSON = Path(os.environ.get("LEASE_FOLDERS_JSON", r"C:\AIAgents\shared\l
 # -> Premio Property Management. Set both here (env-overridable).
 POC_OWNED = os.environ.get(
     "LEASE_POC_OWNED",
-    "<<set LEASE_POC_OWNED — Matt & Jay Arcuri contact info>>")
+    "Matthew Como (203) 232-0077; Jason Arcuri (203) 910-7602")
 POC_PREMIO = os.environ.get(
     "LEASE_POC_PREMIO",
     "Premio Property Management, (203) 666-5300, PremioPropertyManagement@gmail.com")
