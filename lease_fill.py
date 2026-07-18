@@ -103,6 +103,10 @@ CONFIG = {
     },
     "pending_dir":       _p("LEASE_PENDING_DIR", "Pending", root=_LEASES_ROOT),
     "intake_dir":        _p("LEASE_INTAKE_DIR", "Intake", root=_LEASES_ROOT),
+    # Static supporting docs that ride with EVERY signing (lead disclosure,
+    # lead pamphlet, lease-terms overview, ...). Drop PDFs here to expand the
+    # packet — they are uploaded unchanged; only the lease itself swaps.
+    "packet_dir":        _p("LEASE_PACKET_DIR", "Packet", root=_LEASES_ROOT),
     "pending_cards_dir": _p("LEASE_CARDS_DIR", "approvals", "pending", root=_SHARED_ROOT),
     "push_outbox_dir":   _p("LEASE_PUSH_OUTBOX", "push_outbox", root=_SHARED_ROOT),
     "dropbox_rel_root":  os.environ.get("LEASE_DROPBOX_REL_ROOT", "/Leases"),
@@ -420,17 +424,30 @@ def job_id_for(data):
     return f"{_slug(data['property'])}-{_slug(surname)}"[:80]
 
 
-def build_job(data, pdf_path):
+def resolve_packet():
+    """The static supporting docs uploaded with every signing, in filename
+    order (prefix them 01_, 02_ to control order). Empty if the folder has
+    none yet — the lease still sends on its own."""
+    pdir = CONFIG["packet_dir"]
+    if not pdir.exists():
+        return []
+    return [str(p) for p in sorted(pdir.glob("*.pdf"))]
+
+
+def build_job(data, pdf_path, documents=None):
     """The job contract lease_watcher / lease_sender consume. NO SSN here."""
     signers = [{"name": t["name"], "email": t["email"]} for t in data["tenants"]]
     surname = data["tenants"][0]["name"].split()[-1]
+    # The full signing packet: the filled lease first, then the static docs.
+    docs = documents if documents is not None else [str(pdf_path)]
     return {
         "property": data["property"],
         "signing_name": f"Lease - {data['property']} - {surname}",
         "signers": signers,
         "tenant_name": signers[0]["name"],    # legacy single-signer mirror
         "tenant_email": signers[0]["email"],
-        "pdf_path": str(pdf_path),
+        "pdf_path": str(pdf_path),            # the lease (for filing correlation + card link)
+        "documents": docs,                    # everything uploaded to the signing
         # Filing metadata for lease_filer (the signed-lease return trip).
         "property_key": data.get("property_key") or _slug(data["property"]),
         "unit": data.get("unit", ""),
@@ -514,7 +531,8 @@ def process_intake(intake_path, dry_run=False):
     pdf_path = pending / f"{job_id}.pdf"
     tmp_pdf.replace(pdf_path)
 
-    job = build_job(data, pdf_path)
+    documents = [str(pdf_path)] + resolve_packet()   # filled lease + static packet
+    job = build_job(data, pdf_path, documents)
     _atomic_write(pending / f"{job_id}.json", json.dumps(job, indent=2))
 
     pdf_url = make_pdf_url(pdf_path)   # tap-to-open link (empty if no Dropbox token)
@@ -529,35 +547,43 @@ def process_intake(intake_path, dry_run=False):
     return job_id
 
 
-def watch_intake(poll_seconds=5, settle_seconds=3):
-    """Watch the intake folder and fill each intake JSON as it lands. This is
-    the deployment mechanism: for now Jay (or any Claude chat) drops an
-    intake.json here; when Samantha /chat lands, its lease skill writes the
-    same file to the same folder and nothing here changes."""
+def drain_intake(settle_seconds=3):
+    """Process every settled intake JSON in the intake folder once, then
+    return. Success -> _processed; failure -> _failed + a push. This is what
+    the supervisor schedules on an interval."""
     intake_dir = CONFIG["intake_dir"]
     processed = intake_dir / "_processed"
     failed = intake_dir / "_failed"
     for d in (intake_dir, processed, failed):
         d.mkdir(parents=True, exist_ok=True)
-    print(f"LeaseFill watching {intake_dir} for *.json (Ctrl-C to stop)")
+    handled = 0
+    for p in sorted(intake_dir.glob("*.json")):
+        try:
+            if time.time() - p.stat().st_mtime < settle_seconds:
+                continue
+        except FileNotFoundError:
+            continue
+        try:
+            process_intake(p)
+            p.replace(processed / p.name)
+            handled += 1
+        except (LeaseFillError, Exception) as e:
+            print(f"intake {p.name} FAILED: {e}", file=sys.stderr)
+            push("Lease fill failed", f"{p.name}: {e}")
+            try:
+                p.replace(failed / p.name)
+            except Exception:
+                pass
+    return handled
+
+
+def watch_intake(poll_seconds=5):
+    """Loop drain_intake forever (for interactive use; the supervisor uses
+    --drain instead). /chat will later drop the same intake.json here."""
+    print(f"LeaseFill watching {CONFIG['intake_dir']} for *.json (Ctrl-C to stop)")
     try:
         while True:
-            for p in sorted(intake_dir.glob("*.json")):
-                try:
-                    if time.time() - p.stat().st_mtime < settle_seconds:
-                        continue
-                except FileNotFoundError:
-                    continue
-                try:
-                    process_intake(p)
-                    p.replace(processed / p.name)
-                except (LeaseFillError, Exception) as e:
-                    print(f"intake {p.name} FAILED: {e}", file=sys.stderr)
-                    push("Lease fill failed", f"{p.name}: {e}")
-                    try:
-                        p.replace(failed / p.name)
-                    except Exception:
-                        pass
+            drain_intake()
             time.sleep(poll_seconds)
     except KeyboardInterrupt:
         print("LeaseFill watcher stopped.")
@@ -566,11 +592,14 @@ def watch_intake(poll_seconds=5, settle_seconds=3):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--intake", help="fill one intake JSON")
-    ap.add_argument("--watch", action="store_true", help="watch the intake folder")
+    ap.add_argument("--watch", action="store_true", help="watch the intake folder forever")
+    ap.add_argument("--drain", action="store_true", help="process the intake folder once, then exit (supervisor mode)")
     ap.add_argument("--dry-run", action="store_true", help="with --intake: build PDF only, queue nothing")
     args = ap.parse_args()
     if args.watch:
         watch_intake()
+    elif args.drain:
+        drain_intake()
     elif args.intake:
         try:
             process_intake(args.intake, dry_run=args.dry_run)
@@ -578,4 +607,4 @@ if __name__ == "__main__":
             print(f"LEASE FILL ABORTED: {e}", file=sys.stderr)
             sys.exit(1)
     else:
-        ap.error("provide --intake <file> or --watch")
+        ap.error("provide --intake <file>, --drain, or --watch")

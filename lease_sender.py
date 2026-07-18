@@ -242,6 +242,9 @@ def load_job(path: Path) -> dict:
             raise ValueError(f"Signer {i} email looks malformed: {s['email']}")
     if not Path(job["pdf_path"]).exists():
         raise ValueError(f"Lease PDF not found: {job['pdf_path']}")
+    for doc in (job.get("documents") or []):
+        if not Path(doc).exists():
+            raise ValueError(f"Signing packet document not found: {doc}")
     return job
 
 
@@ -266,11 +269,15 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         page.click(S["create_btn"], timeout=t)
     step(auditor, "create signing", create_signing)
 
-    # 3. Upload the filled lease PDF
-    def add_document():
-        page.set_input_files(S["upload_input"], job["pdf_path"], timeout=t)
-        page.wait_for_selector(S["doc_uploaded_marker"], timeout=t)
-    step(auditor, "upload lease pdf", add_document)
+    # 3. Upload the signing packet: the filled lease + every static supporting
+    #    doc (lead disclosure, pamphlet, lease-terms overview, ...).
+    documents = job.get("documents") or [job["pdf_path"]]
+
+    def add_documents():
+        for doc in documents:
+            page.set_input_files(S["upload_input"], doc, timeout=t)
+            page.wait_for_selector(S["doc_uploaded_marker"], timeout=t)
+    step(auditor, f"upload {len(documents)} document(s)", add_documents)
 
     # 4. Apply the saved signature-field template (Templates > Forms)
     def apply_template():
