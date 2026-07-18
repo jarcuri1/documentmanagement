@@ -135,8 +135,10 @@ SELECTORS = {
     "template_row":         "text={template_name}",         # filled at runtime
     "apply_template_btn":   "button:has-text('Apply')",
 
-    # Signers (one or two tenants)
+    # Signers (landlord person + one or two tenants). Reuse existing contacts.
     "add_signer_btn":       "button:has-text('Add Signer')",
+    "contact_search":       "input[placeholder='Search contacts']",  # existing-contact search
+    "contact_result":       "text={name}",                  # a matching existing contact row
     "signer_name":          "input[name='signerName']",
     "signer_email":         "input[name='signerEmail']",
     "signer_role":          "select[name='role']",          # optional; ignored if absent
@@ -226,13 +228,26 @@ def step(auditor: Auditor, label: str, fn):
 
 
 def signers_of(job: dict) -> list:
-    """The lease's signers. Supports the multi-signer contract and the legacy
-    single-tenant shape so older job files still work."""
+    """The lease's TENANT signers. Supports the multi-signer contract and the
+    legacy single-tenant shape so older job files still work."""
     if job.get("signers"):
         return job["signers"]
     if job.get("tenant_name") and job.get("tenant_email"):
         return [{"name": job["tenant_name"], "email": job["tenant_email"]}]
     return []
+
+
+def all_signers(job: dict) -> list:
+    """Everyone who signs, in order: the landlord person first (the individual
+    signing on the owner's behalf — NOT the owner LLC), then the tenant(s).
+    Each is {name, email, role}."""
+    out = []
+    ls = job.get("landlord_signer")
+    if ls and ls.get("name"):
+        out.append({"name": ls["name"], "email": ls.get("email", ""), "role": "Landlord"})
+    for s in signers_of(job):
+        out.append({"name": s["name"], "email": s["email"], "role": "Tenant"})
+    return out
 
 
 def load_job(path: Path) -> dict:
@@ -249,6 +264,12 @@ def load_job(path: Path) -> dict:
             raise ValueError(f"Signer {i} missing name/email: {s!r}")
         if not re.match(rf"^{_EMAIL_TOKEN}$", s["email"]):
             raise ValueError(f"Signer {i} email looks malformed: {s['email']}")
+    ls = job.get("landlord_signer")
+    if ls and ls.get("name"):
+        # A landlord signer must carry an email so the recipient check can
+        # confirm it on the review screen (otherwise it reads as unexpected).
+        if not ls.get("email") or not re.match(rf"^{_EMAIL_TOKEN}$", ls["email"]):
+            raise ValueError(f"Landlord signer needs a valid email: {ls!r}")
     if not Path(job["pdf_path"]).exists():
         raise ValueError(f"Lease PDF not found: {job['pdf_path']}")
     for doc in (job.get("documents") or []):
@@ -304,17 +325,31 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         step(auditor, f"add template: {tpl}",
              (lambda name=tpl: apply_template_by_name(name)))
 
-    # 5. Add each signer (one or two tenants)
+    # 6. Add each signer — landlord person + tenant(s). Reuse an existing
+    #    SmartMLS Sign contact when the name already exists (so a repeat
+    #    landlord like Matt isn't re-entered); type a new contact in full only
+    #    when there's no match.
+    def add_one_signer(sr):
+        page.click(S["add_signer_btn"], timeout=t)
+        matched = False
+        if page.locator(S["contact_search"]).count():
+            page.fill(S["contact_search"], sr["name"], timeout=t)
+            result = page.locator(S["contact_result"].format(name=sr["name"]))
+            if result.count():
+                result.first.click(timeout=t)   # select the existing contact
+                matched = True
+        if not matched:
+            page.fill(S["signer_name"], sr["name"], timeout=t)
+            if sr.get("email"):
+                page.fill(S["signer_email"], sr["email"], timeout=t)
+        if page.locator(S["signer_role"]).count():
+            page.select_option(S["signer_role"], label=sr["role"])
+        page.click(S["signer_save"], timeout=t)
+
     def add_signers():
-        for s in signers_of(job):
-            page.click(S["add_signer_btn"], timeout=t)
-            page.fill(S["signer_name"], s["name"], timeout=t)
-            page.fill(S["signer_email"], s["email"], timeout=t)
-            # role select is optional depending on template roles; ignore if absent
-            if page.locator(S["signer_role"]).count():
-                page.select_option(S["signer_role"], label="Tenant")
-            page.click(S["signer_save"], timeout=t)
-    step(auditor, "add tenant signers", add_signers)
+        for sr in all_signers(job):
+            add_one_signer(sr)
+    step(auditor, "add signers (landlord + tenants)", add_signers)
 
     # 7. HARD CHECK — every approved signer email must appear on-screen exactly
     #    (normalized, case-insensitive) and no OTHER email may appear.
@@ -322,7 +357,7 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         container = page.locator(S["review_email_text"])
         container.wait_for(timeout=t)
         text = container.inner_text()
-        approved = {s["email"].strip().lower() for s in signers_of(job)}
+        approved = {s["email"].strip().lower() for s in all_signers(job) if s.get("email")}
         # Exact token match, not a substring test: 'jsmith@x.com' must not be
         # accepted because it is a substring of 'xjsmith@x.com'.
         tokens = {tok.lower() for tok in re.findall(_EMAIL_SCRAPE, text)}

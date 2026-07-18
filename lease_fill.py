@@ -252,6 +252,12 @@ _UTIL = {
     "oil": ("Fuel:", 0), "gas": ("Fuel:", 1), "propane": ("Fuel:", 2),
 }
 
+# Which tenant fields WE fill on the lease. The rest are left blank on purpose
+# because they are SmartMLS Sign fillable blocks the tenant completes at signing
+# (default: Address + City/State/Zip + SSN are tenant-filled; we only put the
+# name, since we already have it). Override with LEASE_TENANT_FILL="name,address".
+_TENANT_FILL = {f.strip() for f in os.environ.get("LEASE_TENANT_FILL", "name").split(",") if f.strip()}
+
 
 def _fill_document(data):
     lease_type = data["lease_type"]
@@ -273,13 +279,20 @@ def _fill_document(data):
     ssns = [p for p in doc.paragraphs if "Social Security Number" in p.text]
     if len(blocks) < 2 or len(ssns) < 2:
         raise LeaseFillError("expected two tenant slots in the template")
+    def _f(t, field):
+        # Fill this tenant field only if we own it; else leave the blank for the
+        # tenant's SmartMLS Sign fillable block.
+        return t.get(field, "") if field in _TENANT_FILL else ""
+
     for ti, t in enumerate(data["tenants"][:2]):
+        name = t["name"] if "name" in _TENANT_FILL else ""
         if lease_type == "multi_family":
-            fill_blanks(blocks[ti], [t["name"], t.get("address", ""), t.get("city_state_zip", "")])
+            fill_blanks(blocks[ti], [name, _f(t, "address"), _f(t, "city_state_zip")])
         else:
-            insert_before_break(blocks[ti], t["name"])
-            fill_blanks(blocks[ti], [t.get("address", ""), t.get("city_state_zip", "")])
-        if t.get("ssn"):
+            if name:
+                insert_before_break(blocks[ti], name)
+            fill_blanks(blocks[ti], [_f(t, "address"), _f(t, "city_state_zip")])
+        if _f(t, "ssn"):
             fill_blanks(ssns[ti], [t["ssn"]])
 
     # Single-family utility checkboxes
