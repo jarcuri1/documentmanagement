@@ -618,7 +618,12 @@ def process_intake(intake_path, dry_run=False):
     pdf_path = pending / f"{job_id}.pdf"
     tmp_pdf.replace(pdf_path)
 
-    documents = [str(pdf_path)] + resolve_packet()   # filled lease + static packet
+    # Packet = filled lease + filled supporting forms (Rental Terms Summary,
+    # ...) + any static packet PDFs. Signature-template docs are added by the
+    # sender, not here.
+    from lease_forms import fill_supporting_forms
+    forms = fill_supporting_forms(data, pending, job_id)
+    documents = [str(pdf_path)] + forms + resolve_packet()
     job = build_job(data, pdf_path, documents)
     _atomic_write(pending / f"{job_id}.json", json.dumps(job, indent=2))
 
