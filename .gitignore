@@ -1,2 +1,10 @@
 __pycache__/
 *.pyc
+
+# Automation browser profile — contains the live SmartMLS session cookies.
+# NEVER commit this.
+chrome-profile/
+
+# Reference PDFs generated locally for overlay alignment (regenerable).
+single_family_lease.pdf
+multi_family_lease.pdf

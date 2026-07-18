@@ -131,7 +131,20 @@ CONFIG = {
 SELECTORS = {
     # SmartMLS Sign — Signings dashboard
     "logged_in_marker":     "text=New Signing",            # proves the SSO session is alive
-    "signin_with_mls_btn":  "button:has-text('Sign in with Smart MLS')",  # only during --setup
+    "signin_with_mls_btn":  "button:has-text('Sign in with Smart MLS')",  # propkit landing page
+
+    # SmartMLS SSO (Keycloak realm 'connectmls') login form. Captured from the
+    # real page. Used ONLY for unattended re-login when the persisted session
+    # has lapsed — creds come from Windows Credential Manager (see set_login.py),
+    # never from a file. 'remember_me' is the device-trust toggle that keeps MFA
+    # from re-prompting; we always check it.
+    "sso_username":         "#username",
+    "sso_password":         "#password",
+    "sso_remember_me":      "#rememberMe",
+    "sso_submit":           "#kc-login",
+    # If device trust has lapsed, Keycloak shows an OTP/MFA step instead of
+    # redirecting. We detect it and abort loudly (a human must re-trust).
+    "sso_mfa_marker":       "text=/one[- ]time code|verification code|authenticator|otp/i",
 
     # New signing
     "new_signing_btn":      "button:has-text('New Signing')",
@@ -204,6 +217,68 @@ def notify(level: str, message: str, job_name: str = ""):
     tmp = outbox / (name + ".tmp")
     tmp.write_text(json.dumps(payload), encoding="utf-8")
     tmp.replace(outbox / name)
+
+
+def get_credentials():
+    """Read SmartMLS creds from Windows Credential Manager (stored by
+    set_login.py). Returns (username, password), or (None, None) if the vault
+    is empty or keyring isn't available. The password is never logged or
+    written to disk — it lives only in the OS credential store and in memory
+    for the moment of login."""
+    try:
+        import keyring
+    except ImportError:
+        return None, None
+    try:
+        username = keyring.get_password("LeaseAgent-SmartMLS", "__username__")
+        if not username:
+            return None, None
+        password = keyring.get_password("LeaseAgent-SmartMLS", username)
+        return (username, password) if password else (None, None)
+    except Exception:
+        return None, None
+
+
+def login_if_needed(page):
+    """Ensure the SSO session is live. If it has lapsed, log back in from the
+    stored credentials, checking 'Remember me' so device trust persists and MFA
+    stays suppressed. Raises (via assert / PWTimeout, handled by step()) with a
+    clear, human-actionable message when a person is genuinely required."""
+    t = CONFIG["step_timeout_ms"]
+    S = SELECTORS
+    # Already on the dashboard? The persisted session is still good.
+    try:
+        page.wait_for_selector(S["logged_in_marker"], timeout=5_000)
+        return
+    except PWTimeout:
+        pass
+    # Not logged in. Get to the Keycloak form (propkit landing has a button).
+    if page.locator(S["signin_with_mls_btn"]).count():
+        page.click(S["signin_with_mls_btn"], timeout=t)
+    page.wait_for_selector(S["sso_username"], timeout=t)  # PWTimeout -> step() aborts
+    username, password = get_credentials()
+    assert username and password, (
+        "SmartMLS session expired and no stored credentials were found. Run "
+        "`python set_login.py` at the fleet PC to save them (or "
+        "`python lease_sender.py --setup` to log in by hand once).")
+    page.fill(S["sso_username"], username, timeout=t)
+    page.fill(S["sso_password"], password, timeout=t)
+    if page.locator(S["sso_remember_me"]).count():
+        try:
+            page.check(S["sso_remember_me"], timeout=5_000)
+        except Exception:
+            pass  # non-fatal; login still proceeds
+    page.click(S["sso_submit"], timeout=t)
+    # Success = dashboard reappears. If MFA is demanded instead, device trust
+    # has lapsed and only a human can restore it — abort loudly, don't hang.
+    try:
+        page.wait_for_selector(S["logged_in_marker"], timeout=t)
+    except PWTimeout:
+        assert not page.locator(S["sso_mfa_marker"]).count(), (
+            "SmartMLS demanded MFA during unattended login — device trust has "
+            "lapsed. Run `python lease_sender.py --setup` at the PC and check "
+            "'Remember me' to restore hands-free login.")
+        raise  # genuine timeout: let step() screenshot + abort
 
 
 class Auditor:
@@ -303,6 +378,7 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
     # 1. Open SmartMLS Sign; confirm the SSO session is alive (never type creds)
     def goto_app():
         page.goto(CONFIG["sign_url"], timeout=t)
+        login_if_needed(page)   # unattended re-login if the session has lapsed
         page.wait_for_selector(S["logged_in_marker"], timeout=t)
     step(auditor, "smartmls sign dashboard (session alive)", goto_app)
 
