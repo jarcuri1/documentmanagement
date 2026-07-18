@@ -143,6 +143,9 @@ SELECTORS = {
     "signer_email":         "input[name='signerEmail']",
     "signer_role":          "select[name='role']",          # optional; ignored if absent
     "signer_save":          "button:has-text('Save')",
+    # Delete the unused 2nd-tenant role + its fields on a single-tenant signing
+    # (the overlay is built for two tenants; an unassigned role blocks Send).
+    "remove_second_tenant": "[data-role='Tenant 2'] button:has-text('Remove')",
 
     # Review + send
     "review_email_text":    ".signers-list",                # container we read emails back from
@@ -350,6 +353,13 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         for sr in all_signers(job):
             add_one_signer(sr)
     step(auditor, "add signers (landlord + tenants)", add_signers)
+
+    # 6b. Single tenant -> remove the overlay's unused 2nd-tenant role and its
+    #     fields, or SmartMLS Sign refuses to send (unassigned fields).
+    if len(signers_of(job)) < 2:
+        def remove_second_tenant():
+            page.click(S["remove_second_tenant"], timeout=t)
+        step(auditor, "remove unused 2nd tenant slot", remove_second_tenant)
 
     # 7. HARD CHECK — every approved signer email must appear on-screen exactly
     #    (normalized, case-insensitive) and no OTHER email may appear.
