@@ -623,10 +623,13 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         try:
             for i in range(count):
                 edits.nth(i).click(timeout=t)
-                page.wait_for_selector(S["participant_email"], timeout=t)
-                val = page.locator(S["participant_email"]).first.input_value()
-                if val:
-                    found.add(val.strip().lower())
+                # In edit mode the email renders as display text in a contact
+                # card (not an input), so scrape it from the open dialog.
+                page.wait_for_selector(S["participant_role"], timeout=t)
+                page.wait_for_timeout(600)
+                dtxt = page.locator("body").inner_text()
+                for tok in re.findall(_EMAIL_SCRAPE, dtxt):
+                    found.add(tok.lower())
                 page.click(S["participant_cancel"], timeout=t)
                 page.wait_for_timeout(500)
         except Exception as e:
@@ -662,6 +665,16 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         if not state["sent_clicked"]:
             page.click(S["send_btn"], timeout=t)
             state["sent_clicked"] = True
+            page.wait_for_timeout(1500)
+            # As the send commits, a "Save Contact Group? — save these contacts
+            # as a signing group for future signings" prompt appears. Decline it.
+            try:
+                if page.get_by_text("save these contacts as a signing group",
+                                    exact=False).count():
+                    page.get_by_role("button", name="No", exact=True).first.click(timeout=8_000)
+                    page.wait_for_timeout(1500)
+            except Exception:
+                pass
         page.wait_for_selector(S["sent_confirmation"], timeout=t)
     step(auditor, "send signing", send)
 

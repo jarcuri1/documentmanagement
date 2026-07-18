@@ -49,18 +49,26 @@ The live app differs substantially from the placeholder assumptions in
 - Send: `button:has-text('Send Signing')`. Save draft: `[data-testid="signing-form-save-draft-btn"]`.
 - A sent signing shows `Resend signing` / `Withdraw` instead of Send.
 
-## OPEN DESIGN QUESTION (blocks the sender rewrite)
-Applying the overlay template via *Add Document(s) → Select Template* adds it as a
-SEPARATE document next to the uploaded filled lease — it does NOT overlay its
-fields onto the uploaded lease, and it does NOT auto-create participants.
+## RESOLVED — how the overlay's fields land on the filled lease
+Do NOT use *Add Document(s) → Select Template* for the overlay (that adds a
+separate document). Instead, on the uploaded lease's row, click the gear
+(`button:has(path[d^='M12 15.75'])`) → "Apply Signing Overlay" → pick the
+overlay by name → Select → a field-mapping dialog opens (Role Options:
+Tenant (1)/(2)/Landlord + All Fields, all pre-checked) → Select again to
+confirm. The overlay's fields land on the FILLED lease and its roles become the
+signing's participant roles. Confirmed by a real end-to-end send (2026-07-18).
 
-Since the overlay was built on the BLANK reference PDF, this yields two lease
-copies (filled-but-fieldless + fields-but-blank-data). Need Jay's intended
-mechanism for landing the overlay's signature fields on the FILLED lease before
-coding the assembly step. Candidates to investigate:
-  - a per-document "apply template/fields to THIS document" action in the editor,
-  - or building the field layout so the sender draws fields by coordinate,
-  - or a different template type ("form" applied to an uploaded doc).
+## Send flow quirks (learned on the first real send)
+- Participant Role is a generic dropdown (Landlord, Tenant, ...). Options gain a
+  "(+Add new)" suffix once a contact exists, so match the role as a PREFIX.
+- Saving a participant whose email matches an existing contact pops a
+  "Do you want to merge the following contacts?" dialog → click **No**.
+- SmartMLS BLOCKS send if two participants share an email (after normalizing
+  Gmail +tags) unless each has a phone number — real signers have distinct
+  emails so this is normally moot; the test used three distinct inboxes.
+- Clicking **Send Signing** pops a "Save Contact Group?" dialog → click **No**;
+  the send only commits after this is answered. Success = the invite email
+  ("eSigning Invitation | <signing name>") arrives from smartmls@propkit.io.
 
 ## Test artifacts to clean up (drafts I created while mapping)
 Signings named `ZZ SELECTOR TEST - delete me` / `SELECTOR TEST` and draft id
