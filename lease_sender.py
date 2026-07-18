@@ -89,7 +89,16 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # ----------------------------------------------------------------------
 CONFIG = {
     "sign_url": "https://signings.smartmls.propkit.io/signings",  # SmartMLS Sign app
-    "template_name": "Residential Lease",   # exact name of your SmartMLS Sign field template (Templates > Forms)
+    "template_name": "Residential Lease",   # exact name of the LEASE signature overlay (Templates > Forms)
+    # The other packet documents already exist as SmartMLS Sign templates with
+    # their signature/initial spots. A signing is built by adding templates ONE
+    # AT A TIME, so list their exact names here, in the order they should be
+    # added. Expand by adding a name (and building that template once in Sign).
+    "packet_templates": [
+        # "Lead-Based Paint Disclosure",
+        # "Protect Your Family From Lead",
+        # "Lease Terms Overview",
+    ],
     "browser_profile_dir": r"C:\AIAgents\LeaseAgent\chrome-profile",
     "dropbox_root": r"D:\Dropbox\Dropbox\Leases",   # adjust if Dropbox lives elsewhere
     "sent_dir": r"D:\Dropbox\Dropbox\Leases\Sent",
@@ -269,8 +278,9 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         page.click(S["create_btn"], timeout=t)
     step(auditor, "create signing", create_signing)
 
-    # 3. Upload the signing packet: the filled lease + every static supporting
-    #    doc (lead disclosure, pamphlet, lease-terms overview, ...).
+    # 3. Upload the filled lease PDF (plus any static-PDF docs in documents).
+    #    Supporting docs that already exist as Smart Sign templates are ADDED
+    #    in step 5, not uploaded.
     documents = job.get("documents") or [job["pdf_path"]]
 
     def add_documents():
@@ -279,13 +289,20 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
             page.wait_for_selector(S["doc_uploaded_marker"], timeout=t)
     step(auditor, f"upload {len(documents)} document(s)", add_documents)
 
-    # 4. Apply the saved signature-field template (Templates > Forms)
-    def apply_template():
+    # 4 + 5. Assemble the packet by adding templates ONE AT A TIME (Smart Sign
+    #        requires this): first the lease signature overlay, then each
+    #        supporting-doc template by name, in order.
+    def apply_template_by_name(tpl_name):
         page.click(S["templates_btn"], timeout=t)
-        row = S["template_row"].format(template_name=CONFIG["template_name"])
-        page.click(row, timeout=t)
+        page.click(S["template_row"].format(template_name=tpl_name), timeout=t)
         page.click(S["apply_template_btn"], timeout=t)
-    step(auditor, "apply lease template", apply_template)
+        page.wait_for_selector(S["doc_uploaded_marker"], timeout=t)
+
+    step(auditor, "apply lease overlay",
+         lambda: apply_template_by_name(CONFIG["template_name"]))
+    for tpl in CONFIG["packet_templates"]:
+        step(auditor, f"add template: {tpl}",
+             (lambda name=tpl: apply_template_by_name(name)))
 
     # 5. Add each signer (one or two tenants)
     def add_signers():
