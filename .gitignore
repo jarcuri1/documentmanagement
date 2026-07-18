@@ -8,3 +8,7 @@ chrome-profile/
 # Reference PDFs generated locally for overlay alignment (regenerable).
 single_family_lease.pdf
 multi_family_lease.pdf
+
+# LibreOffice isolated conversion profiles (created next to converted PDFs).
+.lo-*/
+.lo-.*
