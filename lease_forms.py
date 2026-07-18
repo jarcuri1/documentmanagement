@@ -14,17 +14,24 @@ Fields are filled via PyMuPDF (appearance streams are regenerated, so the
 values render in any viewer, including SmartMLS Sign).
 """
 
+import json
 import os
 from pathlib import Path
 
 import fitz  # PyMuPDF
 
 _TEMPLATE_DIR = Path(os.environ.get("LEASE_TEMPLATE_DIR", str(Path(__file__).with_name("templates"))))
+_FOLDERS_JSON = Path(os.environ.get("LEASE_FOLDERS_JSON", r"C:\AIAgents\shared\lease_folders.json"))
 
-# The property manager / point of contact printed on the Rental Terms Summary.
-# Override with LEASE_POINT_OF_CONTACT, or per-lease via intake "point_of_contact".
-POINT_OF_CONTACT = os.environ.get(
-    "LEASE_POINT_OF_CONTACT",
+# Point of Contact on the Rental Terms Summary depends on WHO manages the
+# property: our own properties (folder-map tree "personal") -> Matt & Jay;
+# properties managed for clients under the management company (tree "premio")
+# -> Premio Property Management. Set both here (env-overridable).
+POC_OWNED = os.environ.get(
+    "LEASE_POC_OWNED",
+    "<<set LEASE_POC_OWNED — Matt & Jay Arcuri contact info>>")
+POC_PREMIO = os.environ.get(
+    "LEASE_POC_PREMIO",
     "Premio Property Management, (203) 666-5300, PremioPropertyManagement@gmail.com")
 
 
@@ -34,6 +41,22 @@ class LeaseFormError(Exception):
 
 def _find(names, prefix):
     return next((n for n in names if n and n.startswith(prefix)), None)
+
+
+def _property_tree(property_key):
+    """personal (ours) / premio (managed) / '' from the folder map."""
+    try:
+        m = json.loads(_FOLDERS_JSON.read_text(encoding="utf-8"))
+        return (m.get(property_key) or {}).get("tree", "")
+    except Exception:
+        return ""
+
+
+def _point_of_contact(data):
+    if data.get("point_of_contact"):
+        return data["point_of_contact"]
+    tree = data.get("management_tree") or _property_tree(data.get("property_key", ""))
+    return POC_PREMIO if tree == "premio" else POC_OWNED
 
 
 def fill_rental_terms_summary(data, out_pdf):
@@ -55,8 +78,8 @@ def fill_rental_terms_summary(data, out_pdf):
         _find(names, "Premises"): data["premises_address"],
         _find(names, "Name of Tenant"): tenants,
         "fill_3": landlord,                                  # Name of Landlord
-        _find(names, "Point of Contact"): data.get("point_of_contact") or POINT_OF_CONTACT,
-        "fill_5": f"{data['term_start']} – {data['term_end']}",   # Lease Term
+        _find(names, "Point of Contact"): _point_of_contact(data),
+        "fill_5": f"{data['term_start']} - {data['term_end']}",   # Lease Term (ASCII hyphen)
         _find(names, "Total periodic rent"): f"${data['rent']} monthly",
         _find(names, "Other Charges"): data.get("other_charges") or "None",
     }

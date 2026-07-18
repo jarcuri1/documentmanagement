@@ -564,7 +564,7 @@ def build_card(data, job_id, pdf_path, pdf_url=""):
         f"Type: {kind_label} lease",
         f"Tenant(s): {tenants}",
         f"Rent: ${data['rent']}/mo    Deposit: ${data['deposit']}",
-        f"Term: {data['term_start']} – {data['term_end']}",
+        f"Term: {data['term_start']} - {data['term_end']}",
     ])
     rel = f"{CONFIG['dropbox_rel_root'].rstrip('/')}/Pending/{Path(pdf_path).name}"
     card = {
@@ -583,7 +583,7 @@ def build_card(data, job_id, pdf_path, pdf_url=""):
             "tenants": [{"name": t["name"], "email": t["email"]} for t in data["tenants"]],
             "rent": f"${data['rent']}/mo",
             "deposit": f"${data['deposit']}",
-            "term": f"{data['term_start']} – {data['term_end']}",
+            "term": f"{data['term_start']} - {data['term_end']}",
         },
     }
     if pdf_url:

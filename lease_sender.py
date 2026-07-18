@@ -102,10 +102,14 @@ CONFIG = {
     # their signature/initial spots. A signing is built by adding templates ONE
     # AT A TIME, so list their exact names here, in the order they should be
     # added. Expand by adding a name (and building that template once in Sign).
+    # All premade SmartMLS Sign templates, added in this order. NOTE: confirm
+    # these strings match the template names in Sign > Templates EXACTLY
+    # (character-for-character) — the names below are from Jay's doc list.
     "packet_templates": [
-        # "Lead-Based Paint Disclosure",
-        # "Protect Your Family From Lead",
-        # "Lease Terms Overview",
+        "1_Wiring Fraud Advisory Notice - eXp Connecticut",
+        "protectyourfamily_pamphlet_2026_3 Lead",
+        "Disclosure of Information on Lead-Based Paint and/or Lead-Based Paint Hazards (Rentals)",
+        "Disclosure of Interest in Property",
     ],
     "browser_profile_dir": r"C:\AIAgents\LeaseAgent\chrome-profile",
     "dropbox_root": r"D:\Dropbox\Dropbox\Leases",   # adjust if Dropbox lives elsewhere
