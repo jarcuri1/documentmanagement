@@ -105,8 +105,12 @@ CONFIG = {
     # All premade SmartMLS Sign templates, added in this order. NOTE: confirm
     # these strings match the template names in Sign > Templates EXACTLY
     # (character-for-character) — the names below are from Jay's doc list.
+    # NOTE: "1_Wiring Fraud Advisory Notice - eXp Connecticut" is deliberately
+    # NOT in the packet: it was built for SALES and injects Seller (1)/(2) +
+    # Landlord (1)/(2) roles that wreck a lease's signing flow (verified live
+    # 2026-07-18; Jay's call). If it's ever required for leases, rebuild it in
+    # Sign with the lease role trio first: Tenant (1) / Tenant (2) / Landlord.
     "packet_templates": [
-        "1_Wiring Fraud Advisory Notice - eXp Connecticut",
         "protectyourfamily_pamphlet_2026_3 Lead",
         "Disclosure of Information on Lead-Based Paint and/or Lead-Based Paint Hazards (Rentals)",
         "Disclosure of Interest in Property",
@@ -490,9 +494,48 @@ def _apply_overlay_to_lease(page, overlay_name):
     page.wait_for_timeout(1500)
 
 
+def _click_template_row(page, name, timeout):
+    """Click a template row in the picker by name. The picker has two views
+    toggled by 'My Favorites' and a Search box; templates can live in either
+    view, so: search by name, look in the current view, then toggle and retry."""
+    def _row():
+        exact = page.get_by_text(name, exact=True)
+        if exact.count():
+            return exact.first
+        row = page.locator("div.text-4.font-semibold").filter(has_text=name[:40])
+        return row.first if row.count() else None
+
+    search = page.locator("input[placeholder='Search...']")
+    for attempt in range(2):
+        if search.count():
+            search.first.fill(name[:40], timeout=timeout)
+            page.wait_for_timeout(1200)
+        row = _row()
+        if row:
+            row.scroll_into_view_if_needed()
+            row.click(timeout=timeout)
+            return
+        # not in this view — toggle Favorites/All and look again
+        toggle = page.get_by_text("My Favorites", exact=True)
+        if attempt == 0 and toggle.count():
+            toggle.first.click(timeout=timeout)
+            page.wait_for_timeout(1500)
+    raise AssertionError(f"template not found in picker (both views): {name!r}")
+
+
+def _dismiss_stray_dialog(page):
+    """Close any leftover modal so the next editor click isn't intercepted."""
+    for _ in range(2):
+        if not page.locator("div[class*='z-dialog']").count():
+            return
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(800)
+
+
 def _add_template_by_name(page, name):
     """Add a premade packet template (its own document) by exact name."""
     t = CONFIG["step_timeout_ms"]; S = SELECTORS
+    _dismiss_stray_dialog(page)
     page.click(S["add_documents_btn"], timeout=t)
     page.wait_for_timeout(800)
     page.click(S["select_template_btn"], timeout=t)
@@ -506,7 +549,7 @@ def _add_template_by_name(page, name):
             page.wait_for_timeout(1500)
     except Exception:
         pass
-    page.get_by_text(name, exact=True).first.click(timeout=t)
+    _click_template_row(page, name, t)
     page.wait_for_timeout(500)
     page.click(S["picker_select_btn"], timeout=t)
     page.wait_for_timeout(1500)
