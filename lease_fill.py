@@ -69,7 +69,6 @@ from pathlib import Path
 
 import docx
 import fitz  # PyMuPDF — used to verify the filled layout didn't shift
-from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 # ----------------------------------------------------------------------
@@ -199,20 +198,6 @@ def fill_blanks(paragraph, values):
     return vi
 
 
-def insert_before_break(paragraph, text):
-    """Put `text` on the line before the first <w:br/> (single-family tenant
-    name sits on the numbered-list line, which has no underscore blank)."""
-    for r in paragraph._p.iter(qn("w:r")):
-        br = r.find(qn("w:br"))
-        if br is not None:
-            t = OxmlElement("w:t")
-            t.set(qn("xml:space"), "preserve")
-            t.text = text
-            br.addprevious(t)
-            return True
-    raise LeaseFillError("expected a line break in the tenant block but found none")
-
-
 def check_nth_box(paragraph, index):
     """Turn the index-th '[ ]' in the paragraph into '[X]'."""
     cnt = 0
@@ -289,8 +274,13 @@ def _fill_document(data):
         if lease_type == "multi_family":
             fill_blanks(blocks[ti], [name, _f(t, "address"), _f(t, "city_state_zip")])
         else:
-            if name:
-                insert_before_break(blocks[ti], name)
+            # Single-family tenant names are NOT written into the docx: the
+            # numbered name line has no underscore blank, and any text added
+            # there reflows the page (~1 line per tenant), which misaligns the
+            # SmartMLS Sign overlay. Names are stamped onto the rendered PDF
+            # instead (_stamp_tenant_names) — a PDF-layer stamp cannot reflow
+            # anything, so the filled lease keeps the BLANK template's layout
+            # and overlays built on the blank stay aligned.
             fill_blanks(blocks[ti], [_f(t, "address"), _f(t, "city_state_zip")])
         if _f(t, "ssn"):
             fill_blanks(ssns[ti], [t["ssn"]])
@@ -395,12 +385,52 @@ def _compare_layout(blank_pdf, filled_pdf):
             "Shorten the offending value.")
 
 
-# Canonical intake used to render the overlay REFERENCE lease. The overlays in
-# SmartMLS Sign must be built on THIS filled PDF (see build_overlay_references()),
-# not the blank template — filling adds a one-line tenant name per slot, so a
-# blank-built overlay would sit ~1 line per tenant too high. Every real lease
-# with single-line names matches this layout; a name that wraps to two lines is
-# caught by verify_layout_locked and fails closed.
+def _stamp_tenant_names(pdf_path, data):
+    """Write the single-family tenant names onto the rendered PDF next to their
+    numbered markers ('1.', '2.'). A PDF-layer stamp cannot reflow the page, so
+    the filled lease keeps the BLANK template's layout and overlays built on the
+    blank stay aligned. Multi-family names live on an underscore blank and are
+    consumed in-place by fill_blanks (also layout-neutral), so no stamp needed."""
+    if data["lease_type"] != "single_family" or "name" not in _TENANT_FILL:
+        return
+    names = [t["name"] for t in data["tenants"][:2] if t.get("name")]
+    if not names:
+        return
+    doc = fitz.open(str(pdf_path))
+    pg = doc[0]
+    addresses = pg.search_for("Address:")[:2]
+    if len(addresses) < len(names):
+        doc.close()
+        raise LeaseFillError(
+            f"expected {len(names)} tenant Address lines on page 1 to anchor the "
+            f"name stamps, found {len(addresses)}")
+    words = pg.get_text("words")
+    for i, name in enumerate(names):
+        addr = addresses[i]
+        # The tenant's numbered marker ('1.'/'2.') sits in the numbering column
+        # left of the text body, within ~40pt above its Address line.
+        marker = None
+        for x0, y0, x1, y1, txt, *_ in words:
+            if txt == f"{i + 1}." and x0 < 110 and addr.y0 - 40 < y0 < addr.y0:
+                marker = (x0, y0, x1, y1)
+                break
+        if marker is None:
+            doc.close()
+            raise LeaseFillError(f"tenant {i + 1} numbered marker not found for name stamp")
+        pg.insert_text((marker[2] + 8, marker[3] - 1), name,
+                       fontname="helv", fontsize=11, color=(0, 0, 0))
+    stamped = Path(str(pdf_path) + ".stamped")
+    doc.save(str(stamped))
+    doc.close()
+    stamped.replace(pdf_path)
+
+
+# Canonical intake used to render the overlay REFERENCE lease. With names
+# stamped at the PDF layer and every docx fill consuming its underscore blank
+# in-place, the filled lease keeps the BLANK template's layout — overlays built
+# on the blank (or on these references, which now match it) stay aligned. A
+# value that ever DOES reflow the page is caught by verify_layout_locked and
+# fails closed.
 _REF_INTAKE = {
     "single_family": {
         "lease_type": "single_family", "landlord": "Reference Landlord LLC",
@@ -445,6 +475,7 @@ def _reference_pdf_for(lease_type, out_dir=None):
     dest = cache_dir / f"{lease_type}_overlay_reference.pdf"
     if produced.resolve() != dest.resolve():
         produced.replace(dest)
+    _stamp_tenant_names(dest, data)
     tmp_docx.unlink(missing_ok=True)
     if out_dir is None:
         _blank_pdf_cache[key] = str(dest)
@@ -473,6 +504,7 @@ def fill_lease_pdf(data, out_pdf):
         if produced.resolve() != out_pdf.resolve():
             produced.replace(out_pdf)
         verify_layout_locked(out_pdf, data["lease_type"])
+        _stamp_tenant_names(out_pdf, data)   # after verify: stamps can't reflow
     except Exception:
         Path(out_pdf).unlink(missing_ok=True)   # never leave a bad/misaligned PDF
         raise
