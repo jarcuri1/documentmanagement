@@ -105,16 +105,21 @@ CONFIG = {
     # All premade SmartMLS Sign templates, added in this order. NOTE: confirm
     # these strings match the template names in Sign > Templates EXACTLY
     # (character-for-character) — the names below are from Jay's doc list.
-    # NOTE: "1_Wiring Fraud Advisory Notice - eXp Connecticut" is deliberately
-    # NOT in the packet: it was built for SALES and injects Seller (1)/(2) +
-    # Landlord (1)/(2) roles that wreck a lease's signing flow (verified live
-    # 2026-07-18; Jay's call). If it's ever required for leases, rebuild it in
-    # Sign with the lease role trio first: Tenant (1) / Tenant (2) / Landlord.
+    # NOTE: "1_Wiring Fraud Advisory Notice - eXp Connecticut" is OUT of the
+    # lease packet (Jay's call, 2026-07-19): it's a sales doc whose Seller
+    # roles don't belong on a lease. If a template ever injects roles we don't
+    # use, they're excluded at add time via the Role Options dialog (see
+    # template_keep_roles) or removed via the Distribution-party trick
+    # (_remove_row_via_distribution) — both taught by Jay.
     "packet_templates": [
         "protectyourfamily_pamphlet_2026_3 Lead",
         "Disclosure of Information on Lead-Based Paint and/or Lead-Based Paint Hazards (Rentals)",
         "Disclosure of Interest in Property",
     ],
+    # Role base-names to KEEP when adding a packet template (checkboxes in the
+    # template's Role Options dialog). Anything else (Buyer, Seller, Licensee,
+    # ...) is unchecked so it never creates a participant row or orphan fields.
+    "template_keep_roles": ["Tenant", "Landlord"],
     "browser_profile_dir": r"C:\AIAgents\LeaseAgent\chrome-profile",
     "dropbox_root": r"D:\Dropbox\Dropbox\Leases",   # adjust if Dropbox lives elsewhere
     "sent_dir": r"D:\Dropbox\Dropbox\Leases\Sent",
@@ -412,6 +417,16 @@ def load_job(path: Path) -> dict:
         # confirm it on the review screen (otherwise it reads as unexpected).
         if not ls.get("email") or not re.match(rf"^{_EMAIL_TOKEN}$", ls["email"]):
             raise ValueError(f"Landlord signer needs a valid email: {ls!r}")
+    emails = [s["email"].strip().lower() for s in signers]
+    if ls and ls.get("email"):
+        emails.append(ls["email"].strip().lower())
+    dupes = sorted({e for e in emails if emails.count(e) > 1})
+    if dupes:
+        raise ValueError(
+            f"Signers share an email address {dupes!r}. SmartMLS Sign requires a "
+            f"phone number per participant when emails repeat, which the "
+            f"automation does not provide — give each signer a distinct email "
+            f"in the intake.")
     if not Path(job["pdf_path"]).exists():
         raise ValueError(f"Lease PDF not found: {job['pdf_path']}")
     for doc in (job.get("documents") or []):
@@ -446,14 +461,32 @@ def _upload_document(page, pdf_path):
     page.wait_for_selector(f"text={_doc_display_name(pdf_path)}", timeout=t)
 
 
+def _doc_listed(page, name, timeout_ms):
+    """Wait until `name` appears as a row in the Documents PANEL (not a modal).
+    This is the only trustworthy postcondition that a document actually
+    attached — matching the filename anywhere on screen also matches the
+    upload modal and lets silent failures through."""
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        listed = page.evaluate(
+            "(n)=>[...document.querySelectorAll('.group_document')]"
+            ".some(e=>(e.innerText||'').includes(n))", name)
+        if listed:
+            return True
+        page.wait_for_timeout(500)
+    return False
+
+
 def _add_uploaded_document(page, pdf_path):
     """Add another uploaded PDF (e.g. the filled Rental Terms Summary) from the
-    editor via '+ Add Document(s)'."""
+    editor via '+ Add Document(s)'. The upload modal shows the file with a
+    check mark once received; it then needs its confirm/close — and the doc
+    MUST then appear in the Documents panel (hard postcondition)."""
     t = CONFIG["step_timeout_ms"]; S = SELECTORS
+    name = _doc_display_name(pdf_path)
+    _dismiss_stray_dialog(page)
     page.click(S["add_documents_btn"], timeout=t)
     page.wait_for_timeout(800)
-    # Prefer an explicit upload option if the menu offers one; otherwise the
-    # hidden uploader input may already be present.
     for lbl in ("Upload Document(s)", "Upload Document", "Upload"):
         opt = page.get_by_text(lbl, exact=False)
         if opt.count():
@@ -464,10 +497,15 @@ def _add_uploaded_document(page, pdf_path):
                 pass
     page.wait_for_timeout(600)
     page.set_input_files(S["upload_input"], pdf_path, timeout=t)
-    page.wait_for_selector(f"text={_doc_display_name(pdf_path)}", timeout=t)
+    # The upload modal attaches the file and closes ITSELF (~6s, verified
+    # live). Touch nothing — clicking or Escaping mid-upload discards it.
+    # The doc appearing in the Documents panel is the completion signal.
+    assert _doc_listed(page, name, t), (
+        f"uploaded document {name!r} never appeared in the Documents panel — "
+        f"the upload may have been interrupted")
 
 
-def _apply_overlay_to_lease(page, overlay_name):
+def _apply_overlay_to_lease(page, overlay_name, exclude_roles=()):
     """Apply the signature-field overlay onto the uploaded FILLED lease. Called
     while the lease is the ONLY document, so there is exactly one document gear.
 
@@ -487,11 +525,49 @@ def _apply_overlay_to_lease(page, overlay_name):
     page.get_by_text(overlay_name, exact=True).first.click(timeout=t)
     page.wait_for_timeout(500)
     page.locator(S["picker_select_btn"]).last.click(timeout=t)   # -> field-mapping dialog
-    # Confirm the mapping dialog (defaults: all roles + all fields).
+    # Mapping dialog: keep every overlay role, EXCEPT drop the unused second
+    # tenant slot on a single-tenant lease (its fields would orphan and block
+    # Send), then confirm.
     page.wait_for_selector("text=Role Options", timeout=t)
+    page.wait_for_timeout(500)
+    if exclude_roles:
+        dropped = _uncheck_mapping_roles(page, keep_bases=None, exclude_exact=exclude_roles)
+        if dropped:
+            print(f"    excluded overlay roles: {dropped}")
     page.locator(S["picker_select_btn"]).last.click(timeout=t)
     page.wait_for_selector("text=Role Options", state="detached", timeout=t)
     page.wait_for_timeout(1500)
+
+
+def _uncheck_mapping_roles(page, keep_bases=None, exclude_exact=()):
+    """In an open Role Options mapping dialog, uncheck role rows so they never
+    create participant rows or orphan fields (Jay's method). A role stays
+    checked when its base name is in keep_bases (None = keep all) and it isn't
+    in exclude_exact. Returns the roles unchecked."""
+    return page.evaluate(
+        """([keep, exclude])=>{
+          const out=[];
+          const boxes=[...document.querySelectorAll("input[type=checkbox]")];
+          for(const box of boxes){
+            let row=box;
+            for(let i=0;i<5;i++){
+              row=row.parentElement; if(!row) break;
+              const t=(row.innerText||'').trim();
+              if(t && t.length<40){
+                const role=t.split('\\n')[0].trim();
+                const base=role.replace(/\\s*\\(\\d+\\)$/,'').trim();
+                const isRole=/^[A-Z][A-Za-z' ]+(\\s*\\(\\d+\\))?$/.test(role)
+                             && !/^(All Fields|Signature and Initial Fields Only|Other Fields|Form Only|Text Box|Checkbox|Radio|Dropdown|Date|Signature|Initials|Full Name|Email|Attachment|Stamp|Page)/i.test(role);
+                const drop=isRole && box.checked &&
+                           ((keep!==null && !keep.includes(base)) || exclude.includes(role));
+                if(drop){ box.click(); out.push(role); }
+                break;
+              }
+              if(t && t.length>=40) break;
+            }
+          }
+          return out;
+        }""", [keep_bases if keep_bases is not None else None, list(exclude_exact)])
 
 
 def _click_template_row(page, name, timeout):
@@ -499,9 +575,9 @@ def _click_template_row(page, name, timeout):
     toggled by 'My Favorites' and a Search box; templates can live in either
     view, so: search by name, look in the current view, then toggle and retry."""
     def _row():
-        exact = page.get_by_text(name, exact=True)
-        if exact.count():
-            return exact.first
+        # Only the card TITLE (div.text-4.font-semibold) is the click target.
+        # get_by_text can resolve to a text-3 subtitle elsewhere in the dialog,
+        # which sits under another layer and times out the click.
         row = page.locator("div.text-4.font-semibold").filter(has_text=name[:40])
         return row.first if row.count() else None
 
@@ -523,13 +599,15 @@ def _click_template_row(page, name, timeout):
     raise AssertionError(f"template not found in picker (both views): {name!r}")
 
 
-def _dismiss_stray_dialog(page):
-    """Close any leftover modal so the next editor click isn't intercepted."""
-    for _ in range(2):
+def _dismiss_stray_dialog(page, attempts=10):
+    """Close any leftover modal (template preview, prompt, ...) so the next
+    editor click isn't intercepted. Escapes repeatedly until the dialog layer
+    is actually gone — the post-template-add preview can take a few."""
+    for _ in range(attempts):
         if not page.locator("div[class*='z-dialog']").count():
             return
         page.keyboard.press("Escape")
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(700)
 
 
 def _add_template_by_name(page, name):
@@ -551,72 +629,297 @@ def _add_template_by_name(page, name):
         pass
     _click_template_row(page, name, t)
     page.wait_for_timeout(500)
-    page.click(S["picker_select_btn"], timeout=t)
+    page.locator(S["picker_select_btn"]).last.click(timeout=t)
+    # After the picker's Select, EITHER the Role Options / field-mapping
+    # dialog opens (roles to import -> uncheck the junk, confirm with its own
+    # Select) OR the template attaches directly (no new roles to map). Accept
+    # both; retry the picker Select once if neither happened.
+    deadline = time.time() + t / 1000.0
+    retried = False
+    while True:
+        if page.get_by_text("Role Options", exact=False).count():
+            page.wait_for_timeout(800)
+            excluded = _uncheck_mapping_roles(page, keep_bases=CONFIG.get("template_keep_roles"))
+            if excluded:
+                print(f"    excluded template roles: {excluded}")
+            page.wait_for_timeout(600)
+            page.locator(S["picker_select_btn"]).last.click(timeout=t)
+            break
+        if _doc_listed(page, name[:25], 1):
+            break
+        if time.time() > deadline:
+            raise StepFailure(f"template {name!r}: neither the mapping dialog nor "
+                              f"the attached document appeared after Select")
+        if not retried and time.time() > deadline - t / 2000.0                 and page.locator("input[placeholder='Search...']").count():
+            page.locator(S["picker_select_btn"]).last.click(timeout=t)
+            retried = True
+        page.wait_for_timeout(700)
     page.wait_for_timeout(1500)
-    # Some template adds confirm via a generic prompt (dialog-prompt-ok-btn).
+    assert _doc_listed(page, name[:25], t), (
+        f"template {name!r} never appeared in the Documents panel — its "
+        f"mapping dialog was likely dismissed instead of confirmed")
+
+
+def _decline_contact_merge(page):
+    """After a participant save, Sign may ask 'Do you want to merge the
+    following contacts?'. Always decline — the automation must never silently
+    mutate Jay's saved Contacts. (Escape is the verified decline path.)"""
     try:
-        ok = page.locator("[data-testid='dialog-prompt-ok-btn']")
-        if ok.count() and not page.locator(S["participant_section"]).count():
-            ok.first.click(timeout=4_000)
-            page.wait_for_timeout(1500)
+        if page.get_by_text("Do you want to merge", exact=False).count():
+            no = page.get_by_role("button", name="No", exact=True)
+            if no.count():
+                no.first.click(timeout=4_000)
+            else:
+                page.keyboard.press("Escape")
+            page.wait_for_timeout(1000)
     except Exception:
         pass
-    page.wait_for_timeout(1000)
 
 
-def _fill_participant_dialog(page, sr):
-    """Fill the open 'Edit Participant' modal: role (dropdown), first/last name,
-    email, type=Signer, then Save."""
+def _fill_participant_dialog(page, sr, pick_role=True):
+    """Fill the open 'Edit Participant' modal: role (combobox — verified model:
+    picking base 'Tenant' creates the numbered instance 'Tenant (1)', a second
+    pick creates 'Tenant (2)', which is what binds the overlay's role fields),
+    first/last name, email, type=Signer, then Save."""
     t = CONFIG["step_timeout_ms"]; S = SELECTORS
     first, last = _split_name(sr["name"])
     page.wait_for_selector(S["participant_section"], timeout=t)
-    # Role is a dropdown of generic role types. Options render as e.g.
-    # "Tenant" or "Tenant (+Add new)" (a suffix appears once a contact exists),
-    # so match on the role as a prefix, not an exact string.
-    if sr.get("role"):
+    if pick_role and sr.get("role"):
         page.locator(S["participant_role"]).click(timeout=t)
-        page.wait_for_timeout(500)
-        role_re = re.compile(rf"^{re.escape(sr['role'])}(\b|\s|\(|$)")
-        opt = page.get_by_role("option", name=role_re)
-        if opt.count():
-            opt.first.click(timeout=5_000)
-        else:
-            page.locator(f"text=/^{re.escape(sr['role'])}( \\(\\+Add new\\))?$/").last.click(timeout=5_000)
+        page.wait_for_timeout(800)
+        base = sr["role"]
+        opts = page.locator("[role=option], li")
+        picked = False
+        for pattern in (base, f"{base} (+Add new)"):
+            cand = opts.filter(has_text=pattern)
+            if cand.count():
+                cand.first.click(timeout=5_000)
+                picked = True
+                break
+        assert picked, f"role option {base!r} not found in the participant role list"
+        page.wait_for_timeout(600)
+    # The name fields are contact-autocomplete comboboxes: typing opens a
+    # suggestions dropdown, and any later click can accidentally select a
+    # contact into a spare row. Tab out of each field (Jay's manual pattern)
+    # to commit the text and close the dropdown before the next action.
     page.fill(S["participant_first"], first, timeout=t)
+    page.locator(S["participant_first"]).press("Tab")
+    page.wait_for_timeout(300)
     page.fill(S["participant_last"], last, timeout=t)
+    page.locator(S["participant_last"]).press("Tab")
+    page.wait_for_timeout(300)
     if sr.get("email"):
         page.fill(S["participant_email"], sr["email"], timeout=t)
+        page.locator(S["participant_email"]).press("Tab")
+        page.wait_for_timeout(300)
     # Ensure the participant is a Signer (not Reviewer/Distribution).
     try:
         page.locator(S["participant_type"]).get_by_text("Signer", exact=True).first.click(timeout=3_000)
     except Exception:
         pass
     page.click(S["participant_save"], timeout=t)
-    page.wait_for_timeout(1200)
-    # When the email matches an existing SmartMLS contact, a "Do you want to
-    # merge the following contacts?" dialog appears. Keep them separate (No) so
-    # the automation never silently mutates Jay's saved contacts.
+    page.wait_for_timeout(1500)
+    _decline_contact_merge(page)
+    _dismiss_stray_dialog(page)
+    page.wait_for_timeout(500)
+
+
+def _participant_edit_index(page, row_label, exact=False):
+    """Index of the edit button whose Signing Flow row matches `row_label`.
+    exact=True matches the row's FIRST LINE exactly (needed because every row
+    also carries a 'Signer' subtitle, so substring matching is ambiguous).
+    -1 if absent."""
+    return page.evaluate(
+        """([target, exact])=>{
+          const SEL="[data-testid='button-edit-participant']";
+          const btns=[...document.querySelectorAll(SEL)];
+          const rowOf=(b)=>{  // climb while parent still holds ONLY this button,
+                              // stopping at the stage container
+            let n=b;
+            while(n.parentElement
+                  && n.parentElement.querySelectorAll(SEL).length===1
+                  && !n.parentElement.querySelector("[data-testid='add-role']")
+                  && !(n.parentElement.matches && n.parentElement.matches("[data-testid='stage-item']"))){
+              n=n.parentElement;
+            }
+            return n;
+          };
+          return btns.findIndex(b=>{
+            const t=(rowOf(b).innerText||'').trim();
+            const first=t.split('\\n')[0].trim();
+            return exact ? first===target : t.includes(target);
+          });
+        }""", [row_label, exact])
+
+
+def _participant_row_labels(page):
+    """First line of each participant row in the Signing Flow, in edit-button
+    order: 'Test Tenant One (Tenant (1))' for an assigned row, or a bare role
+    like 'Tenant (1)' / 'Landlord (2)' / 'Signer' for an unassigned one."""
+    return page.evaluate(
+        """()=>{
+          const SEL="[data-testid='button-edit-participant']";
+          const btns=[...document.querySelectorAll(SEL)];
+          const rowOf=(b)=>{
+            let n=b;
+            while(n.parentElement
+                  && n.parentElement.querySelectorAll(SEL).length===1
+                  && !n.parentElement.querySelector("[data-testid='add-role']")
+                  && !(n.parentElement.matches && n.parentElement.matches("[data-testid='stage-item']"))){
+              n=n.parentElement;
+            }
+            return n;
+          };
+          return btns.map(b=>((rowOf(b).innerText||'').trim().split('\\n')[0]||'').trim());
+        }""")
+
+
+def _remove_row_via_distribution(page, row_label):
+    """Remove a leftover participant row using Jay's method: the stage rows
+    have no delete control, but flipping the participant's Type to
+    'Distribution' moves it to the Distribution Party section, where each row
+    DOES have a trash icon. Edit -> Type Distribution -> Save -> trash."""
+    t = CONFIG["step_timeout_ms"]; S = SELECTORS
+    idx = _participant_edit_index(page, row_label, exact=True)
+    assert idx >= 0, f"participant row {row_label!r} not found for removal"
+    page.locator(S["edit_participant_btn"]).nth(idx).click(timeout=t)
+    page.wait_for_selector(S["participant_section"], timeout=t)
+    page.wait_for_timeout(800)
+    page.locator(S["participant_type"]).get_by_text("Distribution", exact=True).first.click(timeout=t)
+    page.wait_for_timeout(500)
+    page.click(S["participant_save"], timeout=t)
+    page.wait_for_timeout(1500)
+    _decline_contact_merge(page)
+    _dismiss_stray_dialog(page)
+    # Now trash it from the Distribution Party section.
+    deleted = page.evaluate(
+        """(label)=>{
+          const trashes=[...document.querySelectorAll("button:has(path)")]
+            .filter(b=>{const p=b.querySelector('path');
+                        return p && (p.getAttribute('d')||'').startsWith('M4.5 5.57');});
+          const inDist=[];
+          for(const b of trashes){
+            let n=b, rowText='';
+            for(let i=0;i<7;i++){
+              n=n.parentElement; if(!n) break;
+              const t=(n.innerText||'').trim();
+              if(t.length<80){ rowText=t; break; }
+              if(t.length>=80) break;
+            }
+            if(rowText.includes('Distribution')) inDist.push({b, rowText});
+          }
+          const hit=inDist.find(x=>x.rowText.includes(label));
+          if(hit){ hit.b.click(); return true; }
+          // the converted blank row may render with an empty label — if the
+          // Distribution section holds exactly one row, that's ours.
+          if(inDist.length===1){ inDist[0].b.click(); return true; }
+          return false;
+        }""", row_label)
+    assert deleted, (f"could not find the Distribution-party trash for "
+                     f"{row_label!r} after converting it")
+    page.wait_for_timeout(1000)
     try:
-        if page.get_by_text("Do you want to merge", exact=False).count():
-            page.get_by_role("button", name="No", exact=True).first.click(timeout=5_000)
-            page.wait_for_timeout(1000)
+        ok = page.locator("[data-testid='dialog-prompt-ok-btn']")
+        if ok.count():
+            ok.first.click(timeout=4_000)
     except Exception:
         pass
-    page.wait_for_timeout(800)
+    page.wait_for_timeout(1200)
+    _dismiss_stray_dialog(page)
 
 
-def add_participants(page, signers):
-    """Assign each signer to a participant row. The overlay pre-creates one row
-    (edit it for the first signer); '+ Add Participant' opens a fresh modal for
-    each of the rest."""
+# Template-injected sale roles that carry no lease signer. Any Signing Flow row
+# whose label matches gets deleted during reconciliation.
+_LEFTOVER_ROLE_RE = re.compile(r"^(Seller|Buyer)(\s*\(\d+\))?$|^Landlord\s*\((?!1\))\d+\)$")
+
+
+def _reconcile_participants(page, job):
+    """Assign the lease's real signers to participant rows and delete the
+    leftover roles the packet templates injected.
+
+    Verified model (live, 2026-07-19): the overlay leaves ONE blank 'Signer'
+    row; packet templates inject their own numbered role rows (the wiring
+    advisory: Landlord (1)/(2), Seller (1)/(2)). Picking base role 'Tenant'
+    creates instance 'Tenant (1)' and binds that role's overlay fields; a
+    second pick creates 'Tenant (2)'. The landlord signer goes into the
+    existing 'Landlord (1)' (or 'Landlord') row; every other injected sale
+    role is deleted."""
     t = CONFIG["step_timeout_ms"]; S = SELECTORS
-    for i, sr in enumerate(signers):
-        if i == 0 and page.locator(S["edit_participant_btn"]).count():
-            page.locator(S["edit_participant_btn"]).first.click(timeout=t)
+    tenants = signers_of(job)
+    ls = job.get("landlord_signer") or {}
+    _dismiss_stray_dialog(page)   # the last template add leaves its preview open
+
+    def edit_row_exact(label):
+        idx = _participant_edit_index(page, label, exact=True)
+        if idx < 0:
+            return False
+        page.locator(S["edit_participant_btn"]).nth(idx).click(timeout=t)
+        page.wait_for_timeout(1000)
+        return True
+
+    # 1. Tenants — tenant i belongs to role instance 'Tenant (i+1)' (the
+    #    overlay's fields are bound to those instances). FILL an existing
+    #    tenant row when a template already created one; a template's bare
+    #    'Tenant' row IS slot 1 (Sign renumbers the family to 'Tenant (1)'
+    #    the moment a second instance appears). Creating instances blindly
+    #    shifts the numbering and misbinds every tenant field.
+    for i, tenant in enumerate(tenants):
+        sr = {"name": tenant["name"], "email": tenant["email"], "role": "Tenant"}
+        targets = [f"Tenant ({i + 1})"] + (["Tenant"] if i == 0 else [])
+        for lbl in targets:
+            if edit_row_exact(lbl):
+                _fill_participant_dialog(page, sr, pick_role=False)
+                break
+        else:
+            # No pre-made row: reuse the blank overlay row or add a fresh
+            # participant, picking the base role (next free instance).
+            if not edit_row_exact("Signer"):
+                page.click(S["add_participant_btn"], timeout=t)
+                page.wait_for_timeout(1000)
+            _fill_participant_dialog(page, sr)
+        labels = _participant_row_labels(page)
+        ok = (f"{tenant['name']} (Tenant ({i + 1}))" in labels
+              or (i == 0 and f"{tenant['name']} (Tenant)" in labels))
+        assert ok, (f"tenant {i + 1} did not land in its role slot; rows now: {labels!r}")
+
+    # Final binding check: with all tenants placed, the family is numbered and
+    # each tenant must own their exact instance (fail closed on any drift).
+    labels = _participant_row_labels(page)
+    for i, tenant in enumerate(tenants):
+        want = f"{tenant['name']} (Tenant ({i + 1}))"
+        solo_ok = len(tenants) == 1 and f"{tenant['name']} (Tenant)" in labels
+        assert want in labels or solo_ok, (
+            f"after placement, tenant {i + 1} is not bound to Tenant ({i + 1}); "
+            f"rows: {labels!r}")
+
+    # 2. Landlord signer into the existing Landlord row (or a new one).
+    if ls.get("name"):
+        sr = {"name": ls["name"], "email": ls.get("email", ""), "role": "Landlord"}
+        if edit_row_exact("Landlord (1)") or edit_row_exact("Landlord"):
+            _fill_participant_dialog(page, sr, pick_role=False)
         else:
             page.click(S["add_participant_btn"], timeout=t)
-        page.wait_for_timeout(1000)
-        _fill_participant_dialog(page, sr)
+            page.wait_for_timeout(1000)
+            _fill_participant_dialog(page, sr)
+        assert any(lb.startswith(f"{ls['name']} (Landlord") for lb in _participant_row_labels(page)), (
+            f"landlord signer did not land in a Landlord role; rows now: "
+            f"{_participant_row_labels(page)!r}")
+
+    # 3. Remove every remaining UNASSIGNED row: known junk roles, the overlay's
+    #    blank 'Signer' row, and any extra unassigned Tenant/Landlord instance
+    #    (e.g. a template's Tenant (2) on a single-tenant lease).
+    def unassigned(labels):
+        return [lb for lb in labels
+                if lb == "Signer"
+                or _LEFTOVER_ROLE_RE.match(lb)
+                or re.match(r"^(Tenant|Landlord)(\s*\(\d+\))?$", lb)]
+    for _ in range(10):   # hard cap; each pass removes one row
+        left = unassigned(_participant_row_labels(page))
+        if not left:
+            break
+        _remove_row_via_distribution(page, left[0])
+    left = unassigned(_participant_row_labels(page))
+    assert not left, f"unassigned participant rows could not be removed: {left!r}"
 
 
 # ----------------------------------------------------------------------
@@ -653,7 +956,10 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
 
     def apply_overlay():
         assert overlay, f"no lease overlay configured for lease_type {job.get('lease_type')!r}"
-        _apply_overlay_to_lease(page, overlay)
+        # Single-tenant lease: drop the overlay's unused Tenant (2) slot so its
+        # fields never orphan.
+        exclude = ("Tenant (2)",) if len(signers_of(job)) < 2 else ()
+        _apply_overlay_to_lease(page, overlay, exclude_roles=exclude)
     step(auditor, f"apply overlay: {overlay}", apply_overlay)
 
     # 4. Add the remaining uploaded documents (e.g. filled Rental Terms Summary).
@@ -666,10 +972,10 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         step(auditor, f"add packet template: {tpl}",
              (lambda name=tpl: _add_template_by_name(page, name)))
 
-    # 6. Assign each signer to a participant — landlord person first, then
-    #    tenant(s). Two tenants map to the overlay's Tenant (1)/(2) by order.
-    step(auditor, "add participants (landlord + tenants)",
-         (lambda: add_participants(page, all_signers(job))))
+    # 6. Reconcile participants: tenants -> Tenant (1)/(2), landlord signer ->
+    #    the Landlord row, and delete the sale roles the templates injected.
+    step(auditor, "reconcile participants (assign signers, prune sale roles)",
+         (lambda: _reconcile_participants(page, job)))
 
     # 7. HARD CHECK — every approved signer email must appear on-screen exactly
     #    (normalized, case-insensitive) and no OTHER email may appear. Emails
@@ -679,20 +985,29 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         # participant's email back from its edit dialog (then Cancel — no change).
         approved = {s["email"].strip().lower() for s in all_signers(job) if s.get("email")}
         found = set()
+        _dismiss_stray_dialog(page)
         edits = page.locator(S["edit_participant_btn"])
         count = edits.count()
         try:
             for i in range(count):
                 edits.nth(i).click(timeout=t)
-                # In edit mode the email renders as display text in a contact
-                # card (not an input), so scrape it from the open dialog.
-                page.wait_for_selector(S["participant_role"], timeout=t)
-                page.wait_for_timeout(600)
+                page.wait_for_selector(S["participant_section"], timeout=t)
+                page.wait_for_timeout(800)
+                # Prefer the email input's value; fall back to scraping the page.
+                try:
+                    val = page.locator(S["participant_email"]).input_value(timeout=5_000)
+                    if val:
+                        found.add(val.strip().lower())
+                except Exception:
+                    pass
                 dtxt = page.locator("body").inner_text()
                 for tok in re.findall(_EMAIL_SCRAPE, dtxt):
                     found.add(tok.lower())
-                page.click(S["participant_cancel"], timeout=t)
-                page.wait_for_timeout(500)
+                try:
+                    page.click(S["participant_cancel"], timeout=5_000)
+                except Exception:
+                    page.keyboard.press("Escape")
+                page.wait_for_timeout(600)
         except Exception as e:
             # Couldn't read a participant back. On a real send this must block;
             # during a --no-send dry run, warn and let the draft be eyeballed.
