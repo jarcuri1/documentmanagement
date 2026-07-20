@@ -313,9 +313,13 @@ def _docx_to_pdf(docx_path, out_dir):
     # A private profile forces an independent soffice instance, so conversion
     # works even when the LibreOffice Quickstarter is running (otherwise the
     # --convert-to is forwarded to the running instance and silently ignored).
-    # .as_uri() yields a correct file:///C:/... URI on Windows (a bare
-    # file://C:\path with backslashes will not parse).
-    profile = (out_dir / f".lo-{docx_path.stem}").resolve()
+    # The profile must live in LOCAL temp, unique per run: putting it in the
+    # (Dropbox-synced) output folder let sync locks corrupt it mid-bootstrap,
+    # making soffice exit instantly with no PDF. .as_uri() yields a correct
+    # file:///C:/... URI on Windows.
+    profile = (Path(tempfile.gettempdir()) / "lease_lo"
+               / f"{docx_path.stem}-{os.getpid()}-{int(time.time() * 1000)}").resolve()
+    profile.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env.setdefault("HOME", str(out_dir))  # soffice needs a writable HOME on *nix
     cmd = [CONFIG["soffice_bin"], "--headless",
