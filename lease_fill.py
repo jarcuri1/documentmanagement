@@ -697,6 +697,12 @@ def _atomic_write(path, text):
 
 def process_intake(intake_path, dry_run=False):
     raw = json.loads(Path(intake_path).read_text(encoding="utf-8"))
+    # App-submitted intakes carry auto_send: Jay entered the details himself,
+    # so the phone approval card is skipped — the job is queued WITH its send
+    # decision and the watcher fires on its next tick. He gets the 'Lease
+    # sent' push when the invites are out. File-dropped intakes (no flag)
+    # still go through the approval card.
+    auto_send = bool(raw.get("auto_send"))
     data = normalize_intake(raw)
     job_id = job_id_for(data)
 
@@ -722,6 +728,19 @@ def process_intake(intake_path, dry_run=False):
     documents = [str(pdf_path)] + forms + resolve_packet()
     job = build_job(data, pdf_path, documents)
     _atomic_write(pending / f"{job_id}.json", json.dumps(job, indent=2))
+
+    if auto_send:
+        # Queue the send decision directly (same shape the app's Send tap
+        # writes) — the lease watcher claims and sends on its next tick.
+        decision = {
+            "id": card_id_for(job_id), "action": "send", "text": "",
+            "decided_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "auto": True,
+        }
+        decisions_dir = CONFIG["pending_cards_dir"].parent / "decisions"
+        _atomic_write(decisions_dir / f"{decision['id']}.json", json.dumps(decision, indent=2))
+        print(f"queued {job_id} AUTO-SEND: {pdf_path} (no approval card — app intake)")
+        return job_id
 
     pdf_url = make_pdf_url(pdf_path)   # tap-to-open link (empty if no Dropbox token)
 
