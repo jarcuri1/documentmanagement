@@ -96,9 +96,60 @@ def fill_rental_terms_summary(data, out_pdf):
     return str(out_pdf)
 
 
+# The licensee's initials, stamped on the Disclosure of Interest's
+# "(Licensee to initial below as applicable)" blanks.
+LICENSEE_INITIALS = os.environ.get("LEASE_LICENSEE_INITIALS", "JA")
+
+
+def fill_disclosure_of_interest(data, out_pdf):
+    """Fill the CT Disclosure of Present or Contemplated Interest (flat PDF,
+    stamped by coordinate): the Subject Property Address plus the licensee
+    initials on the applicable items. Which items depends on who runs the
+    property (verified against Jay's live demo, 2026-07-20):
+      owned (tree 'personal'): item 2 (Seller's/Landlord's Agent) + its
+        'An entity in which Licensee has a substantial ownership interest'
+        sub-line + item 3 (ownership interest)
+      managed (tree 'premio'): item 3 only.
+    Replaces the old SmartMLS Sign template for this form — its fill-in boxes
+    are canvas-drawn and reject synthetic input, so the PDF layer it is."""
+    tpl = _TEMPLATE_DIR / "disclosure_of_interest.pdf"
+    if not tpl.exists():
+        raise LeaseFormError(f"Disclosure of Interest template not found: {tpl}")
+    tree = data.get("management_tree") or _property_tree(data.get("property_key", "")) or "personal"
+    # (x, baseline_y) stamp points measured from the template geometry.
+    marks = {
+        "item2":        (84, 333),    # '2.___' initial blank
+        "item2_entity": (111, 383),   # '___An entity in which Licensee has ...'
+        "item3":        (86, 409),    # '3. ___' initial blank
+    }
+    picked = ["item2", "item2_entity", "item3"] if tree != "premio" else ["item3"]
+
+    doc = fitz.open(str(tpl))
+    pg = doc[0]
+    pg.insert_text((203, 144), data["premises_address"], fontname="helv",
+                   fontsize=10, color=(0, 0, 0))
+    for name in picked:
+        x, y = marks[name]
+        pg.insert_text((x, y), LICENSEE_INITIALS, fontname="helv",
+                       fontsize=10, color=(0, 0, 0))
+    Path(out_pdf).parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out_pdf))
+    doc.close()
+    # Read-back verification: the address and every initial must be present.
+    chk = fitz.open(str(out_pdf))
+    txt = chk[0].get_text()
+    chk.close()
+    if data["premises_address"].split(",")[0] not in txt:
+        raise LeaseFormError("Disclosure of Interest: address stamp did not land")
+    if txt.count(LICENSEE_INITIALS) < len(picked):
+        raise LeaseFormError("Disclosure of Interest: initial stamps did not land")
+    return str(out_pdf)
+
+
 # Registry of fillable supporting forms. Add (name, filler_fn) to expand.
 SUPPORTING_FORMS = [
     ("rental-terms-summary", fill_rental_terms_summary),
+    ("disclosure-of-interest", fill_disclosure_of_interest),
 ]
 
 

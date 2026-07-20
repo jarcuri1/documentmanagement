@@ -111,15 +111,27 @@ CONFIG = {
     # use, they're excluded at add time via the Role Options dialog (see
     # template_keep_roles) or removed via the Distribution-party trick
     # (_remove_row_via_distribution) — both taught by Jay.
+    # NOTE: 'Disclosure of Interest in Property' is NOT a template anymore —
+    # its fill-in boxes are canvas-drawn and reject synthetic input, so
+    # lease_forms.fill_disclosure_of_interest pre-fills the PDF (address +
+    # licensee initials per property tree) and it rides as an UPLOAD.
     "packet_templates": [
         "protectyourfamily_pamphlet_2026_3 Lead",
         "Disclosure of Information on Lead-Based Paint and/or Lead-Based Paint Hazards (Rentals)",
-        "Disclosure of Interest in Property",
     ],
     # Role base-names to KEEP when adding a packet template (checkboxes in the
     # template's Role Options dialog). Anything else (Buyer, Seller, Licensee,
     # ...) is unchecked so it never creates a participant row or orphan fields.
     "template_keep_roles": ["Tenant", "Landlord"],
+    # Checkboxes to tick on the Disclosure of Interest, by management tree
+    # (Jay 2026-07-19): owned properties -> '2: Himself or herself' + item 3;
+    # Premio-managed -> item 3 only. Tree comes from the job or the folder map;
+    # unknown defaults to 'personal' (most leases are own properties, and the
+    # approval card gates every send anyway).
+    "disclosure_checks": {
+        "personal": ["item2_himself", "item3"],
+        "premio":   ["item3"],
+    },
     "browser_profile_dir": r"C:\AIAgents\LeaseAgent\chrome-profile",
     "dropbox_root": r"D:\Dropbox\Dropbox\Leases",   # adjust if Dropbox lives elsewhere
     "sent_dir": r"D:\Dropbox\Dropbox\Leases\Sent",
@@ -922,6 +934,193 @@ def _reconcile_participants(page, job):
     assert not left, f"unassigned participant rows could not be removed: {left!r}"
 
 
+# Disclosure of Interest checkbox positions, in Playwright's 1440x900 input
+# space (page CSS is 1920x1200 at dpr 0.75; mouse = CSS * 0.75). Measured from
+# the validation-state audit screenshots (canvas-drawn, so coordinates it is).
+_DISCLOSURE_BOX_COORDS = {
+    "item2_main":    (235, 433),   # '2. ... Seller's/Landlord's Agent' box
+    "item2_himself": (266, 461),   # under 2: 'Himself or herself'
+    "item3":         (239, 518),   # '3. ... owns or has ... interest'
+}
+
+
+def _management_tree(job):
+    # personal (owned) / premio (managed) for this job's property — from the
+    # job itself or the folder map; unknown -> personal.
+    tree = (job.get("management_tree") or "").strip().lower()
+    if tree:
+        return tree
+    try:
+        m = json.loads(Path(r"C:\AIAgents\shared\lease_folders.json").read_text(encoding="utf-8"))
+        t = (m.get(job.get("property_key", "")) or {}).get("tree", "")
+        if t:
+            return t
+    except Exception:
+        pass
+    return "personal"
+
+
+def _check_disclosure_boxes(page, job, auditor=None):
+    # Tick the Disclosure of Interest checkboxes per the property's tree
+    # (single canvas click each — the template starts all-unchecked, so one
+    # click per box is deterministic). Runs right after the address boxes are
+    # filled, while the editor is still on that document's page.
+    tree = _management_tree(job)
+    boxes = (CONFIG.get("disclosure_checks") or {}).get(tree, ["item3"])
+    print(f"    disclosure checks for tree {tree!r}: {boxes}")
+    for name in boxes:
+        x, y = _DISCLOSURE_BOX_COORDS[name]
+        page.mouse.click(x, y)
+        page.wait_for_timeout(700)
+    if auditor:
+        auditor.snap(f"disclosure boxes checked ({tree}: {len(boxes)})")
+
+
+def _missing_param_count(page):
+    """Parse the editor's 'N out of M fields have missing parameters' badge.
+    0 when absent — no sender-side fill-ins are pending."""
+    txt = page.evaluate(
+        "()=>{const e=[...document.querySelectorAll('*')].find(x=>x.children.length<=2"
+        "&&(x.innerText||'').includes('fields have missing parameters'));"
+        "return e?e.innerText:''}")
+    m = re.search(r"(\d+)\s*out of\s*(\d+)", txt or "")
+    return int(m.group(1)) if m else 0
+
+
+def _address_lines(job):
+    """Two lines for a street-address block: '123 Test St, 1st Floor' /
+    'Waterbury, CT 06704' (falls back to the whole string twice)."""
+    prem = (job.get("premises_address") or job.get("property") or "").strip()
+    parts = [p.strip() for p in prem.split(",") if p.strip()]
+    if len(parts) >= 3:
+        return [", ".join(parts[:-2]), ", ".join(parts[-2:])]
+    return [prem, prem]
+
+
+def _fill_missing_param_fields(page, job, auditor=None):
+    """Fill sender-side fill-in fields flagged by the missing-parameters badge.
+    The fields render ON the canvas (no DOM), so: click the badge's navigator
+    to select/scroll to the next flagged field, double-click it (Jay's method
+    — opens an inline text editor), type the value, commit, repeat until the
+    badge clears. Values: the property address lines."""
+    t = CONFIG["step_timeout_ms"]
+    n = _missing_param_count(page)
+    if n == 0:
+        return
+    values = _address_lines(job)
+    vi = 0
+    stagnant = 0
+    for _ in range(n + 6):
+        n_now = _missing_param_count(page)
+        if n_now == 0:
+            return
+        # Find a flagged field to fill. Preferred: the error-styled overlay
+        # boxes over the canvas (red border/background, 'Please type
+        # something'); fallback: the badge's navigator control, then rescan.
+        def scan():
+            return page.evaluate(
+                """()=>{
+                  const cv=document.querySelector("[data-testid='signing-form_editor_canvas']");
+                  if(!cv) return {cands:[], all:[]};
+                  const cr=cv.getBoundingClientRect();
+                  const boxes=[...document.querySelectorAll('div,section,span')].filter(e=>{
+                    const r=e.getBoundingClientRect();
+                    if(!(r.width>40 && r.width<620 && r.height>12 && r.height<70)) return false;
+                    if(!(r.left>=cr.left-10 && r.right<=cr.right+10
+                         && r.top>=cr.top-10 && r.bottom<=cr.bottom+10)) return false;
+                    const st=getComputedStyle(e);
+                    if(st.position!=='absolute' && st.position!=='fixed') return false;
+                    return true;
+                  });
+                  const info=boxes.map(e=>{
+                    const r=e.getBoundingClientRect();
+                    const st=getComputedStyle(e);
+                    const cls=(e.className||'').toString();
+                    const reddish=/danger|error|invalid/i.test(cls)
+                      || /rgb\(2[0-4][0-9], *[0-9]{1,2}, *[0-9]{1,2}/.test(st.borderColor)
+                      || /rgb\(2[0-4][0-9], *[0-9]{1,2}, *[0-9]{1,2}/.test(st.backgroundColor)
+                      || /rgba?\(2[0-4][0-9]/.test(st.outlineColor||'');
+                    return {x:Math.round(r.left+r.width/2), y:Math.round(r.top+r.height/2),
+                            w:Math.round(r.width), h:Math.round(r.height),
+                            cls:cls.slice(0,70), reddish,
+                            bc:st.borderColor, bg:st.backgroundColor};
+                  });
+                  return {cands:info.filter(i=>i.reddish), all:info};
+                }""")
+        found = scan()
+        print(f"    missing fields: {n_now}; error-styled overlays: "
+              f"{len(found['cands'])} (of {len(found['all'])} overlays)")
+        # Jay's demo (pause-demo events.log) decoded the success signal: a
+        # double-click that actually lands on a fill-in box pops a DOM
+        # TEXTAREA (w-full h-full resize-none ...) and focuses it. So: sweep
+        # candidate points across the box's area, double-clicking until that
+        # textarea takes focus, then type. Box 1 while both boxes are
+        # missing, box 2 when one remains. (The 'found' overlay scan stays as
+        # a hint but the sweep is the workhorse — fields are canvas-drawn.)
+        def editor_open():
+            return page.evaluate(
+                "()=>{const a=document.activeElement;"
+                "return !!(a && a.tagName==='TEXTAREA')}")
+
+        def editor_opens_within(ms):
+            # The canvas editor mounts SLOWLY (>400ms). Poll — a hasty next
+            # click closes the editor that was about to appear, which is what
+            # made the earlier sweeps self-defeating.
+            waited = 0
+            while waited < ms:
+                if editor_open():
+                    return True
+                page.wait_for_timeout(250)
+                waited += 250
+            return editor_open()
+        # Jay's demo gesture, exactly: a SINGLE click first (selects the field,
+        # canvas takes focus), a beat, THEN the double-click opens the editor.
+        # Coordinates are in Playwright's 1440x900 input space (page CSS is
+        # 1920x1200 at dpr 0.75 — factor 0.75): box centers (560,216)/(560,244).
+        ys = (216, 222, 210) if n_now >= 2 else (244, 250, 238)
+        xs = (560, 640, 480)
+        hit = None
+        geom = page.evaluate("()=>({iw:window.innerWidth,ih:window.innerHeight,"
+                             "dpr:window.devicePixelRatio})")
+        print(f"    viewport: {geom}")
+        page.wait_for_timeout(1500)   # let the validation view settle first
+        for y in ys:
+            for x in xs:
+                page.mouse.click(x, y)        # select the field
+                page.wait_for_timeout(800)
+                page.mouse.dblclick(x, y)     # open its editor
+                if editor_opens_within(3000):
+                    hit = (x, y)
+                    break
+            if hit:
+                break
+        if auditor:
+            auditor.snap("field sweep " + (f"hit at {hit[0]},{hit[1]}" if hit else "NO HIT"))
+        assert hit, (f"could not open the fill-in box editor anywhere in its "
+                     f"area (box {'1' if n_now >= 2 else '2'})")
+        print(f"    editor opened at {hit}")
+        val = values[0] if n_now >= 2 else values[-1]
+        page.keyboard.type(val, delay=30)
+        vi += 1
+        page.wait_for_timeout(500)
+        # Commit/deselect: click the canvas gutter (inside canvas, off the page).
+        gut = page.evaluate(
+            "()=>{const c=document.querySelector(\"[data-testid='signing-form_editor_canvas']\");"
+            "const r=c.getBoundingClientRect();return {x:Math.round(r.left+12),y:Math.round(r.top+r.height/2)};}")
+        page.mouse.click(gut["x"], gut["y"])
+        page.wait_for_timeout(1200)
+        if auditor:
+            auditor.snap(f"typed {val[:25]!r}")
+        if _missing_param_count(page) >= n_now:
+            stagnant += 1
+            assert stagnant < 5, (
+                f"missing-parameters count is not decreasing (still {n_now}) — "
+                f"field filling is not landing")
+    assert _missing_param_count(page) == 0, (
+        f"could not clear all missing-parameter fields "
+        f"({_missing_param_count(page)} left)")
+
+
 # ----------------------------------------------------------------------
 # The signing routine
 # ----------------------------------------------------------------------
@@ -976,6 +1175,13 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
     #    the Landlord row, and delete the sale roles the templates injected.
     step(auditor, "reconcile participants (assign signers, prune sale roles)",
          (lambda: _reconcile_participants(page, job)))
+
+    # 6b. Fill the sender-side fill-in fields (e.g. the Disclosure of Interest's
+    #     'Subject Property Address' text boxes). The editor flags them as
+    #     'N out of M fields have missing parameters'; each is double-clicked
+    #     on the canvas and typed (Jay's method).
+    step(auditor, "fill sender fields (missing parameters)",
+         (lambda: _fill_missing_param_fields(page, job, auditor)))
 
     # 7. HARD CHECK — every approved signer email must appear on-screen exactly
     #    (normalized, case-insensitive) and no OTHER email may appear. Emails
@@ -1041,17 +1247,51 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         if not state["sent_clicked"]:
             page.click(S["send_btn"], timeout=t)
             state["sent_clicked"] = True
-            page.wait_for_timeout(1500)
-            # As the send commits, a "Save Contact Group? — save these contacts
-            # as a signing group for future signings" prompt appears. Decline it.
+        # Work through the post-Send prompts (observed live, any order):
+        #   - "One or more checkboxes have not been completed. Do you still
+        #     wish to proceed?"  -> Proceed (they're signer-completed fields)
+        #   - "Please fix the issues marked with exclamation mark" + the
+        #     'N out of M fields have missing parameters' badge -> the send was
+        #     BLOCKED by validation: fill the flagged sender fields (property
+        #     address boxes) and click Send again.
+        #   - "Save Contact Group? ... save these contacts as a signing
+        #     group ..."         -> No (never mutate Jay's saved groups)
+        # then wait for the sent confirmation.
+        deadline = time.time() + 3 * t / 1000.0
+        while time.time() < deadline:
+            if page.locator(S["sent_confirmation"]).count():
+                return
             try:
-                if page.get_by_text("save these contacts as a signing group",
-                                    exact=False).count():
-                    page.get_by_role("button", name="No", exact=True).first.click(timeout=8_000)
+                if page.get_by_text("Do you still wish to proceed", exact=False).count():
+                    page.get_by_role("button", name="Proceed", exact=True).first.click(timeout=5_000)
                     page.wait_for_timeout(1500)
+                    continue
+                if page.get_by_text("save these contacts as a signing group", exact=False).count():
+                    # Decline = the prompt's Cancel button (verified in Jay's demo).
+                    page.locator("[data-testid='dialog-prompt-cancel-btn']").first.click(timeout=5_000)
+                    page.wait_for_timeout(1500)
+                    continue
+                if _missing_param_count(page) > 0:
+                    # Validation blocked this send — nothing went out. Fill the
+                    # flagged fields, tick the disclosure checkboxes (once),
+                    # then click Send again.
+                    _dismiss_stray_dialog(page)
+                    _fill_missing_param_fields(page, job, auditor)
+                    if not state.get("boxes_checked"):
+                        _check_disclosure_boxes(page, job, auditor)
+                        state["boxes_checked"] = True
+                    auditor.snap("sender fields filled; resending")
+                    page.click(S["send_btn"], timeout=t)
+                    page.wait_for_timeout(1500)
+                    continue
+            except StepFailure:
+                raise
+            except AssertionError:
+                raise   # step() screenshots and reports these
             except Exception:
                 pass
-        page.wait_for_selector(S["sent_confirmation"], timeout=t)
+            page.wait_for_timeout(700)
+        page.wait_for_selector(S["sent_confirmation"], timeout=5_000)
     step(auditor, "send signing", send)
 
 
