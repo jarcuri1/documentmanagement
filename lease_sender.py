@@ -570,6 +570,15 @@ def _apply_overlay_to_doc(page, doc_stem, overlay_name, exclude_roles=()):
     page.wait_for_timeout(800)
     page.click(S["apply_overlay_item"], timeout=t)
     page.wait_for_timeout(1500)
+    # When the signing already has fields (e.g. the lease overlay), Sign asks
+    # 'Clear Fields — Do you want to clear existing fields?'. NO — keep them;
+    # this overlay only adds the new document's fields.
+    try:
+        if page.get_by_text("Do you want to clear existing fields", exact=False).count():
+            page.get_by_role("button", name="No", exact=True).first.click(timeout=5_000)
+            page.wait_for_timeout(1500)
+    except Exception:
+        pass
     _click_template_row(page, overlay_name, t)   # tolerant: search + substring
     page.wait_for_timeout(500)
     page.locator(S["picker_select_btn"]).last.click(timeout=t)   # -> field-mapping dialog
