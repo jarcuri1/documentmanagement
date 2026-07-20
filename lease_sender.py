@@ -122,7 +122,10 @@ CONFIG = {
     # Role base-names to KEEP when adding a packet template (checkboxes in the
     # template's Role Options dialog). Anything else (Buyer, Seller, Licensee,
     # ...) is unchecked so it never creates a participant row or orphan fields.
-    "template_keep_roles": ["Tenant", "Landlord"],
+    "template_keep_roles": ["Tenant", "Landlord", "Listing Agent"],
+    # The listing agent signs wherever a template carries that role (e.g. the
+    # lead-paint disclosure's agent certification) — always Jason Arcuri.
+    "listing_agent": {"name": "Jason Arcuri", "email": "realtorarcuri@gmail.com"},
     # Checkboxes to tick on the Disclosure of Interest, by management tree
     # (Jay 2026-07-19): owned properties -> '2: Himself or herself' + item 3;
     # Premio-managed -> item 3 only. Tree comes from the job or the folder map;
@@ -133,7 +136,7 @@ CONFIG = {
     # from this overlay; its address/initials/licensee signature are already
     # stamped on the PDF by lease_forms.
     "doc_overlays": {
-        "disclosure-of-interest": "Agent automated disclosure_of_interest",
+        "disclosure-of-interest": "agnet disclosure_of_interest",
     },
     "disclosure_checks": {
         "personal": ["item2_himself", "item3"],
@@ -439,6 +442,9 @@ def load_job(path: Path) -> dict:
     emails = [s["email"].strip().lower() for s in signers]
     if ls and ls.get("email"):
         emails.append(ls["email"].strip().lower())
+    la_email = (CONFIG.get("listing_agent") or {}).get("email", "")
+    if la_email:
+        emails.append(la_email.strip().lower())   # the listing agent signs too
     dupes = sorted({e for e in emails if emails.count(e) > 1})
     if dupes:
         raise ValueError(
@@ -564,7 +570,7 @@ def _apply_overlay_to_doc(page, doc_stem, overlay_name, exclude_roles=()):
     page.wait_for_timeout(800)
     page.click(S["apply_overlay_item"], timeout=t)
     page.wait_for_timeout(1500)
-    page.get_by_text(overlay_name, exact=True).first.click(timeout=t)
+    _click_template_row(page, overlay_name, t)   # tolerant: search + substring
     page.wait_for_timeout(500)
     page.locator(S["picker_select_btn"]).last.click(timeout=t)   # -> field-mapping dialog
     # Mapping dialog: keep every overlay role, EXCEPT drop the unused second
@@ -953,6 +959,18 @@ def _reconcile_participants(page, job):
             f"landlord signer did not land in a Landlord role; rows now: "
             f"{_participant_row_labels(page)!r}")
 
+    # 2b. Listing agent — fill any 'Listing Agent' row the templates created
+    #     (Jay: 'make sure Jason Arcuri is in there as the listing agent no
+    #     matter what').
+    la = CONFIG.get("listing_agent") or {}
+    if la.get("name"):
+        for lbl in ("Listing Agent (1)", "Listing Agent"):
+            if edit_row_exact(lbl):
+                _fill_participant_dialog(
+                    page, {"name": la["name"], "email": la.get("email", ""),
+                           "role": "Listing Agent"}, pick_role=False)
+                break
+
     # 3. Remove every remaining UNASSIGNED row: known junk roles, the overlay's
     #    blank 'Signer' row, and any extra unassigned Tenant/Landlord instance
     #    (e.g. a template's Tenant (2) on a single-tenant lease).
@@ -960,7 +978,7 @@ def _reconcile_participants(page, job):
         return [lb for lb in labels
                 if lb == "Signer"
                 or _LEFTOVER_ROLE_RE.match(lb)
-                or re.match(r"^(Tenant|Landlord)(\s*\(\d+\))?$", lb)]
+                or re.match(r"^(Tenant|Landlord|Listing Agent)(\s*\(\d+\))?$", lb)]
     for _ in range(10):   # hard cap; each pass removes one row
         left = unassigned(_participant_row_labels(page))
         if not left:
@@ -1237,6 +1255,9 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         # The Signing Flow rows show name+role but not the email, so read each
         # participant's email back from its edit dialog (then Cancel — no change).
         approved = {s["email"].strip().lower() for s in all_signers(job) if s.get("email")}
+        la_email = (CONFIG.get("listing_agent") or {}).get("email", "")
+        if la_email:
+            approved.add(la_email.strip().lower())
         found = set()
         _dismiss_stray_dialog(page)
         edits = page.locator(S["edit_participant_btn"])
