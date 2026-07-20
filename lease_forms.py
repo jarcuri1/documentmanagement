@@ -99,6 +99,10 @@ def fill_rental_terms_summary(data, out_pdf):
 # The licensee's initials, stamped on the Disclosure of Interest's
 # "(Licensee to initial below as applicable)" blanks.
 LICENSEE_INITIALS = os.environ.get("LEASE_LICENSEE_INITIALS", "JA")
+LICENSEE_NAME = os.environ.get("LEASE_LICENSEE_NAME", "Jason Arcuri")
+# Signature image for the Licensee line (Jay signs the disclosure as sender;
+# every send is gated by his phone approval). PNG dropped by Jay.
+_LICENSEE_SIG = _TEMPLATE_DIR / "jay_signature.png"
 
 
 def fill_disclosure_of_interest(data, out_pdf):
@@ -132,6 +136,18 @@ def fill_disclosure_of_interest(data, out_pdf):
         x, y = marks[name]
         pg.insert_text((x, y), LICENSEE_INITIALS, fontname="helv",
                        fontsize=10, color=(0, 0, 0))
+    # Licensee signature block: signature image (when provided) + date on the
+    # 'Licensee / Date' lines, printed name on its line. Tenant/Landlord
+    # acknowledgment fields come from the SmartMLS Sign overlay, not here.
+    from datetime import date as _date
+    today = f"{_date.today().month}/{_date.today().day}/{_date.today().year}"
+    if _LICENSEE_SIG.exists():
+        # signature sits on the line ending at y=448.6 (x 72-324)
+        pg.insert_image(fitz.Rect(80, 412, 240, 447), filename=str(_LICENSEE_SIG),
+                        keep_proportion=True)
+    pg.insert_text((436, 445), today, fontname="helv", fontsize=10, color=(0, 0, 0))
+    pg.insert_text((75, 484), LICENSEE_NAME, fontname="helv", fontsize=10,
+                   color=(0, 0, 0))
     Path(out_pdf).parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(out_pdf))
     doc.close()

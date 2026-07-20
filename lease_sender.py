@@ -128,6 +128,13 @@ CONFIG = {
     # Premio-managed -> item 3 only. Tree comes from the job or the folder map;
     # unknown defaults to 'personal' (most leases are own properties, and the
     # approval card gates every send anyway).
+    # Overlays applied to UPLOADED packet documents (matched by filename
+    # substring). The disclosure's Tenant/Landlord acknowledgment fields come
+    # from this overlay; its address/initials/licensee signature are already
+    # stamped on the PDF by lease_forms.
+    "doc_overlays": {
+        "disclosure-of-interest": "Agent automated disclosure_of_interest",
+    },
     "disclosure_checks": {
         "personal": ["item2_himself", "item3"],
         "premio":   ["item3"],
@@ -517,20 +524,43 @@ def _add_uploaded_document(page, pdf_path):
         f"the upload may have been interrupted")
 
 
-def _apply_overlay_to_lease(page, overlay_name, exclude_roles=()):
-    """Apply the signature-field overlay onto the uploaded FILLED lease. Called
-    while the lease is the ONLY document, so there is exactly one document gear.
+def _click_doc_gear(page, doc_stem):
+    """Click the settings gear of the Documents-panel row whose text contains
+    `doc_stem`. Falls back to 'the only gear' when a single document exists."""
+    t = CONFIG["step_timeout_ms"]; S = SELECTORS
+    gears = page.locator(f"button:has({S['doc_gear_svg_path']})")
+    if gears.count() == 1:
+        gears.first.click(timeout=t)
+        return
+    clicked = page.evaluate(
+        """([stem, pathPrefix])=>{
+          const gears=[...document.querySelectorAll('button')].filter(b=>{
+            const p=b.querySelector('path');
+            return p && (p.getAttribute('d')||'').startsWith(pathPrefix);});
+          for(const g of gears){
+            let n=g;
+            for(let i=0;i<6;i++){
+              n=n.parentElement; if(!n) break;
+              const t=(n.innerText||'').trim();
+              if(t.length<120){
+                if(t.toLowerCase().includes(stem.toLowerCase())){ g.click(); return true; }
+              } else break;
+            }
+          }
+          return false;
+        }""", [doc_stem[:25], "M12 15.75"])
+    assert clicked, f"no document gear found for row containing {doc_stem!r}"
+
+
+def _apply_overlay_to_doc(page, doc_stem, overlay_name, exclude_roles=()):
+    """Apply a signature-field overlay onto an uploaded document (the lease,
+    the disclosure, ...) via its row gear -> Apply Signing Overlay.
 
     Two 'Select' clicks: the first picks the overlay from the list, which opens a
-    field-mapping dialog (Role Options: Tenant (1)/(2)/Landlord + All Fields, all
-    checked by default); the second confirms it. The overlay's roles become the
-    signing's participant roles."""
+    field-mapping dialog (Role Options + Field Options, all checked by default);
+    the second confirms it. The overlay's roles become participant roles."""
     t = CONFIG["step_timeout_ms"]; S = SELECTORS
-    gear = page.locator(f"button:has({S['doc_gear_svg_path']})")
-    assert gear.count() == 1, (
-        f"expected exactly one document gear before applying the overlay, "
-        f"found {gear.count()} — apply the overlay before adding other documents")
-    gear.first.click(timeout=t)
+    _click_doc_gear(page, doc_stem)
     page.wait_for_timeout(800)
     page.click(S["apply_overlay_item"], timeout=t)
     page.wait_for_timeout(1500)
@@ -549,6 +579,12 @@ def _apply_overlay_to_lease(page, overlay_name, exclude_roles=()):
     page.locator(S["picker_select_btn"]).last.click(timeout=t)
     page.wait_for_selector("text=Role Options", state="detached", timeout=t)
     page.wait_for_timeout(1500)
+
+
+def _apply_overlay_to_lease(page, overlay_name, exclude_roles=()):
+    # Back-compat alias: the lease is the only document when its overlay is
+    # applied, so the single-gear fallback in _click_doc_gear handles it.
+    _apply_overlay_to_doc(page, "", overlay_name, exclude_roles)
 
 
 def _uncheck_mapping_roles(page, keep_bases=None, exclude_exact=()):
@@ -1161,10 +1197,21 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         _apply_overlay_to_lease(page, overlay, exclude_roles=exclude)
     step(auditor, f"apply overlay: {overlay}", apply_overlay)
 
-    # 4. Add the remaining uploaded documents (e.g. filled Rental Terms Summary).
+    # 4. Add the remaining uploaded documents (e.g. filled Rental Terms
+    #    Summary, pre-filled Disclosure of Interest), applying a signature
+    #    overlay right after any upload that has one configured.
+    def add_doc_with_overlay(d):
+        _add_uploaded_document(page, d)
+        stem = Path(d).stem.lower()
+        for key, overlay_name in (CONFIG.get("doc_overlays") or {}).items():
+            if key.lower() in stem:
+                exclude = ("Tenant (2)",) if len(signers_of(job)) < 2 else ()
+                _apply_overlay_to_doc(page, Path(d).stem, overlay_name,
+                                      exclude_roles=exclude)
+                break
     for doc in documents[1:]:
         step(auditor, f"add document: {Path(doc).name}",
-             (lambda d=doc: _add_uploaded_document(page, d)))
+             (lambda d=doc: add_doc_with_overlay(d)))
 
     # 5. Add each premade packet template (its own document), one at a time.
     for tpl in CONFIG["packet_templates"]:
