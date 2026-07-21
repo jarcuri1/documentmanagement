@@ -50,6 +50,41 @@ CONFIG = {
 
 _ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
+# Premio app API — writes the tenant row on Jay's master Google Sheet.
+_PREMIO_APP = os.environ.get("PREMIO_APP_URL",
+                             "https://stalwart-truffle-2dd64a.netlify.app")
+_SHEET_ID = os.environ.get("LEASE_SHEET_ID",
+                           "13gBHnNLf8PVD1j7locnJZdDTBndMadWCpLW4GbDnK50")
+_SHEET_TABS = {"owned": "Combined Empire", "premio": "Premio Property Management"}
+
+
+def _read_sheet_row(tab, property_addr, unit_name):
+    """Current values of the unit row (link-shared CSV export) BEFORE we write,
+    so the job record holds an undo trail. Same row-walk as edit-tenant.js:
+    find the property in column A, then the unit in column B under it.
+    Returns {tenant, phone, deposit, ...} or None."""
+    import csv
+    import io
+    import urllib.parse
+    import urllib.request
+    url = (f"https://docs.google.com/spreadsheets/d/{_SHEET_ID}/gviz/tq"
+           f"?tqx=out:csv&sheet={urllib.parse.quote(_SHEET_TABS[tab])}")
+    with urllib.request.urlopen(url, timeout=30) as r:
+        rows = list(csv.reader(io.StringIO(r.read().decode("utf-8"))))
+    found = False
+    for row in rows[1:]:
+        prop = (row[0] if len(row) > 0 else "").strip()
+        unit = (row[1] if len(row) > 1 else "").strip()
+        if prop == property_addr:
+            found = True
+        elif prop and found:
+            break   # walked into the next property
+        if found and unit == unit_name:
+            g = lambda i: row[i].strip() if len(row) > i else ""
+            return {"tenant": g(2), "phone": g(3), "deposit": g(4),
+                    "col_F": g(5), "col_G": g(6)}
+    return None
+
 
 class LeaseFileError(Exception):
     pass
@@ -124,6 +159,78 @@ def _to_unfiled(signed_pdf, reason, key):
     push("Signed lease needs filing", f"{reason} (key {key!r}). Left in _unfiled.",
          {"job": key})
     return dest
+
+
+def _money(v):
+    """'$2,500' -> 2500 (int when whole); '' / junk -> None."""
+    s = re.sub(r"[^0-9.]", "", str(v or ""))
+    if not s:
+        return None
+    try:
+        f = float(s)
+        return int(f) if f == int(f) else f
+    except ValueError:
+        return None
+
+
+def update_sheet_tenant(job, job_path=None):
+    """Write the new tenant onto Jay's master sheet via the Premio app's
+    edit-tenant function, using the EXACT row strings the wizard captured
+    (job['sheet'] = {tab, property, unit}). Reads the row's current values
+    first and records them in the job record, so every update is reversible.
+    Never raises — a miss is pushed for Jay, the lease is already filed."""
+    import urllib.request
+
+    sheet = job.get("sheet") or {}
+    if not (sheet.get("property") and sheet.get("unit")):
+        return None   # client lease / old app build — nothing to update
+    tenant_names = " & ".join(s["name"] for s in _signers(job) if s.get("name"))
+    body = {
+        "sheetType": "owned" if sheet.get("tab") != "premio" else "premio",
+        "propertyAddress": sheet["property"],
+        "unitName": sheet["unit"],
+        "tenantName": tenant_names,
+        "deposit": _money(job.get("deposit")) or 0,
+        "rent": _money(job.get("rent")),
+        "leaseStart": job.get("term_start_iso", ""),
+        "leaseEnd": job.get("term_end_iso", ""),
+    }
+    try:
+        previous = _read_sheet_row(body["sheetType"], sheet["property"], sheet["unit"])
+    except Exception as e:
+        previous = {"unreadable": str(e)}
+    try:
+        req = urllib.request.Request(
+            f"{_PREMIO_APP}/.netlify/functions/edit-tenant",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=45) as r:
+            resp = json.loads(r.read().decode("utf-8"))
+        ok = bool(resp.get("success"))
+    except Exception as e:
+        resp, ok = {"error": str(e)}, False
+
+    rec_update = {"requested": body, "previous": previous, "response": resp,
+                  "at": datetime.now().isoformat(timespec="seconds")}
+    if job_path:
+        try:
+            rec = json.loads(Path(job_path).read_text(encoding="utf-8"))
+            rec["sheet_update"] = rec_update
+            Path(job_path).write_text(json.dumps(rec, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    if ok:
+        push("Sheet updated",
+             f"{sheet['property']} / {sheet['unit']}: tenant -> {tenant_names}, "
+             f"rent {body['rent']}, deposit {body['deposit']}.",
+             {"job": job.get("property_key", "")})
+    else:
+        push("Sheet update FAILED",
+             f"{sheet['property']} / {sheet['unit']} ({tenant_names}): "
+             f"{resp.get('error') or resp}. Update the row by hand.",
+             {"job": job.get("property_key", "")})
+    return ok
 
 
 def file_signed_lease(signed_pdf, job, job_path=None):
@@ -202,6 +309,10 @@ def file_signed_lease(signed_pdf, job, job_path=None):
     push("Lease filed", f"{address}{unit_part} — {_last_names(job)}{retired_note}",
          {"job": key})
     print(f"filed -> {dest}{retired_note}")
+
+    # Turnover: write the new tenant onto the master sheet (its own push;
+    # failure never un-files the lease).
+    update_sheet_tenant(job, job_path=job_path)
     return dest
 
 

@@ -590,6 +590,8 @@ def normalize_intake(raw):
         "unit": raw.get("unit", ""),
         "filing_address": raw.get("filing_address", ""),
         "term_start_iso": _iso_date(raw["term_start"]),
+        "term_end_iso": _iso_date(raw["term_end"]),
+        "sheet": raw.get("sheet"),   # exact sheet row coords for the tenant update
     }
 
 
@@ -633,6 +635,10 @@ def build_job(data, pdf_path, documents=None):
         "unit": data.get("unit", ""),
         "filing_address": data.get("filing_address") or data["property"].split(",")[0].strip(),
         "term_start_iso": data.get("term_start_iso", ""),
+        "term_end_iso": data.get("term_end_iso", ""),
+        "rent": data.get("rent", ""),
+        "deposit": data.get("deposit", ""),
+        "sheet": data.get("sheet"),   # tab/property/unit for the tenant update
     }
     if ls.get("name") and ls.get("email"):
         job["landlord_signer"] = {"name": ls["name"], "email": ls["email"]}
