@@ -293,12 +293,27 @@ class LeaseWatcher:
 
     def run_sender(self, sending_path):
         cmd = [CONFIG["python_exe"], str(CONFIG["sender_script"]), "--job", str(sending_path)]
+        # Hard wall-clock cap: Sign's page can wedge its own main thread, and a
+        # blocked page.evaluate has NO Playwright timeout — without this cap one
+        # hung sender freezes the whole lease lane (every later tick skips on
+        # the overlap guard). Kill the whole tree (sender + its Chrome).
+        cap_s = int(os.environ.get("LEASE_SENDER_TIMEOUT_S", "1500"))
         try:
-            return subprocess.run(cmd).returncode
+            proc = subprocess.Popen(cmd)
         except FileNotFoundError as e:
             push("Lease error", f"could not launch lease_sender ({e}).",
                  {"job": sending_path.stem})
             return 1
+        try:
+            return proc.wait(timeout=cap_s)
+        except subprocess.TimeoutExpired:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True)
+            push("Lease stuck", f"{sending_path.stem}: sender hit the "
+                 f"{cap_s // 60}-minute cap and was killed. Job left in Sending. "
+                 f"Check Audit + Authentisign before re-queuing — do NOT assume "
+                 f"nothing was sent.", {"job": sending_path.stem})
+            return 124
 
     def reconcile(self, slug, claimed, rc):
         """lease_sender owns all post-launch placement; the watcher never moves

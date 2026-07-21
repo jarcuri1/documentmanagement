@@ -77,6 +77,7 @@ JOB FILE FORMAT (<job>.json):
 
 import json
 import os
+import threading
 import re
 import shutil
 import sys
@@ -1435,6 +1436,20 @@ def process_job(job_path: Path):
     name = job_path.stem
     recipients = ", ".join(s["email"] for s in signers_of(job))
     notify("info", f"Starting signing for {job['property']} -> {recipients}", name)
+
+    # Self-watchdog: a page.evaluate against a wedged Sign tab blocks with NO
+    # Playwright timeout, and nothing below can interrupt it. Fires 2 minutes
+    # before the watcher's tree-kill so the death is at least explained.
+    cap_s = int(os.environ.get("LEASE_SENDER_SELF_CAP_S", "1380"))
+    def _die():
+        notify("error",
+               f"WATCHDOG: signing for {job['property']} exceeded {cap_s // 60} "
+               f"minutes (Sign page likely wedged) — aborting. Job stays in "
+               f"Sending; check Audit + Authentisign before re-queuing.", name)
+        os._exit(4)
+    _wd = threading.Timer(cap_s, _die)
+    _wd.daemon = True   # never keeps a finished sender alive
+    _wd.start()
 
     state = {"sent_clicked": False}
     with sync_playwright() as p:
