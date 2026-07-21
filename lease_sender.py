@@ -1019,8 +1019,10 @@ def _reconcile_participants(page, job):
             # Jay is on EVERY signing as Listing Agent — create the participant.
             page.click(S["add_participant_btn"], timeout=t)
             page.wait_for_timeout(1000)
+            # Signer: the lead-form overlay binds agent fields to this role
+            # (Distribution can't own fields — Sign rejects the send).
             la_sr = {"name": la["name"], "email": la.get("email", ""),
-                     "role": "Listing Agent", "ptype": "Distribution"}
+                     "role": "Listing Agent"}
             if same_person and la.get("phone"):
                 la_sr["phone"] = la["phone"]
             _fill_participant_dialog(page, la_sr)
