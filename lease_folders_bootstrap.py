@@ -53,7 +53,7 @@ _SKIP_EXACT = {
     "leases", "pictures", "tenant list docs", "listing info",
 }
 _SKIP_CONTAINS = ("listing info", "listing photos", "appraisal", "receipts")
-_SKIP_SUBTREES = {"sold properties"}   # do not descend at all
+_SKIP_SUBTREES = {"sold properties", "past clients", "past tenants"}   # do not descend at all
 
 # A folder whose name ends with one of these holds properties, it is not one.
 _CONTAINER_SUFFIXES = (" llc", " investors", " realty", " enterprises")
