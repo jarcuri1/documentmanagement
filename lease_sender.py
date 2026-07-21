@@ -559,31 +559,15 @@ def _add_uploaded_document(page, pdf_path):
 
 
 def _click_doc_gear(page, doc_stem):
-    """Click the settings gear of the Documents-panel row whose text contains
-    `doc_stem`. Falls back to 'the only gear' when a single document exists."""
+    """Click the settings gear for the document being configured. The panel
+    truncates file names (packet docs share a long prefix), so text matching
+    picks the WRONG row — but our flow always configures the document that
+    was just uploaded, which is the LAST row. doc_stem is kept for logging."""
     t = CONFIG["step_timeout_ms"]; S = SELECTORS
     gears = page.locator(f"button:has({S['doc_gear_svg_path']})")
-    if gears.count() == 1:
-        gears.first.click(timeout=t)
-        return
-    clicked = page.evaluate(
-        """([stem, pathPrefix])=>{
-          const gears=[...document.querySelectorAll('button')].filter(b=>{
-            const p=b.querySelector('path');
-            return p && (p.getAttribute('d')||'').startsWith(pathPrefix);});
-          for(const g of gears){
-            let n=g;
-            for(let i=0;i<6;i++){
-              n=n.parentElement; if(!n) break;
-              const t=(n.innerText||'').trim();
-              if(t.length<120){
-                if(t.toLowerCase().includes(stem.toLowerCase())){ g.click(); return true; }
-              } else break;
-            }
-          }
-          return false;
-        }""", [doc_stem[:25], "M12 15.75"])
-    assert clicked, f"no document gear found for row containing {doc_stem!r}"
+    n = gears.count()
+    assert n, "no document gears found"
+    gears.nth(n - 1).click(timeout=t)
 
 
 def _apply_overlay_to_doc(page, doc_stem, overlay_name, exclude_roles=()):
@@ -1288,14 +1272,25 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
     # 4. Add the remaining uploaded documents (e.g. filled Rental Terms
     #    Summary, pre-filled Disclosure of Interest), applying a signature
     #    overlay right after any upload that has one configured.
+    def _field_count():
+        m2 = re.search(r"(\d+)\s+fields", page.locator("body").inner_text())
+        return int(m2.group(1)) if m2 else -1
+
     def add_doc_with_overlay(d):
         _add_uploaded_document(page, d)
         stem = Path(d).stem.lower()
         for key, overlay_name in (CONFIG.get("doc_overlays") or {}).items():
             if key.lower() in stem:
                 exclude = ("Tenant (2)",) if len(signers_of(job)) < 2 else ()
+                before = _field_count()
                 _apply_overlay_to_doc(page, Path(d).stem, overlay_name,
                                       exclude_roles=exclude)
+                after = _field_count()
+                print(f"    overlay {overlay_name[:40]!r}: fields {before} -> {after}")
+                assert after > before >= 0, (
+                    f"overlay {overlay_name!r} applied but the field count did "
+                    f"not increase ({before} -> {after}) — it landed on the "
+                    f"wrong document or has no fields")
                 break
     for doc in documents[1:]:
         step(auditor, f"add document: {Path(doc).name}",
