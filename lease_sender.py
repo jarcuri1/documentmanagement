@@ -1017,6 +1017,7 @@ def _reconcile_participants(page, job):
     #     matter what').
     la = la_cfg
     if la.get("name"):
+        filled_agent = False
         for lbl in ("Listing Agent (1)", "Listing Agent"):
             if edit_row_exact(lbl):
                 la_sr = {"name": la["name"], "email": la.get("email", ""),
@@ -1024,7 +1025,18 @@ def _reconcile_participants(page, job):
                 if same_person and la.get("phone"):
                     la_sr["phone"] = la["phone"]
                 _fill_participant_dialog(page, la_sr, pick_role=False)
+                filled_agent = True
                 break
+        if not filled_agent:
+            # No template creates the row anymore (lead form is an upload):
+            # Jay is on EVERY signing as Listing Agent — create the participant.
+            page.click(S["add_participant_btn"], timeout=t)
+            page.wait_for_timeout(1000)
+            la_sr = {"name": la["name"], "email": la.get("email", ""),
+                     "role": "Listing Agent"}
+            if same_person and la.get("phone"):
+                la_sr["phone"] = la["phone"]
+            _fill_participant_dialog(page, la_sr)
 
     # 3. Remove every remaining UNASSIGNED row: known junk roles, the overlay's
     #    blank 'Signer' row, and any extra unassigned Tenant/Landlord instance
