@@ -127,7 +127,7 @@ CONFIG = {
     "template_keep_roles": ["Tenant", "Landlord", "Listing Agent"],
     # The listing agent signs wherever a template carries that role (e.g. the
     # lead-paint disclosure's agent certification) — always Jason Arcuri.
-    "listing_agent": {"name": "Jason Arcuri", "email": "realtorarcuri@gmail.com", "phone": "2039107602"},
+    "listing_agent": {"name": "Jason Arcuri", "email": "premiopropertymanagement@gmail.com", "phone": "2039107602"},
     # Checkboxes to tick on the Disclosure of Interest, by management tree
     # (Jay 2026-07-19): owned properties -> '2: Himself or herself' + item 3;
     # Premio-managed -> item 3 only. Tree comes from the job or the folder map;
