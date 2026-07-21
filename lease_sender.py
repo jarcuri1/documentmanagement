@@ -127,7 +127,7 @@ CONFIG = {
     "template_keep_roles": ["Tenant", "Landlord", "Listing Agent"],
     # The listing agent signs wherever a template carries that role (e.g. the
     # lead-paint disclosure's agent certification) — always Jason Arcuri.
-    "listing_agent": {"name": "Jason Arcuri", "email": "realtorarcuri@gmail.com"},
+    "listing_agent": {"name": "Jason Arcuri", "email": "realtorarcuri@gmail.com", "phone": "2039107602"},
     # Checkboxes to tick on the Disclosure of Interest, by management tree
     # (Jay 2026-07-19): owned properties -> '2: Himself or herself' + item 3;
     # Premio-managed -> item 3 only. Tree comes from the job or the folder map;
@@ -449,12 +449,17 @@ def load_job(path: Path) -> dict:
     if la_email:
         emails.append(la_email.strip().lower())   # the listing agent signs too
     dupes = sorted({e for e in emails if emails.count(e) > 1})
+    la = (CONFIG.get("listing_agent") or {}).get("email", "").strip().lower()
+    # Jay may be agent AND landlord on the same signing (SmartMLS accepts the
+    # shared email when both participants carry a phone; reconcile fills it).
+    if la and ls and (ls.get("email") or "").strip().lower() == la:
+        dupes = [d for d in dupes if d != la]
     if dupes:
         raise ValueError(
             f"Signers share an email address {dupes!r}. SmartMLS Sign requires a "
-            f"phone number per participant when emails repeat, which the "
-            f"automation does not provide — give each signer a distinct email "
-            f"in the intake.")
+            f"phone number per participant when emails repeat — give each signer "
+            f"a distinct email in the intake (only Jay-as-agent + Jay-as-landlord "
+            f"may share).")
     if not Path(job["pdf_path"]).exists():
         raise ValueError(f"Lease PDF not found: {job['pdf_path']}")
     for doc in (job.get("documents") or []):
@@ -778,6 +783,18 @@ def _fill_participant_dialog(page, sr, pick_role=True):
         page.fill(S["participant_email"], sr["email"], timeout=t)
         page.locator(S["participant_email"]).press("Tab")
         page.wait_for_timeout(300)
+    if sr.get("phone"):
+        # Phone is required by Sign when two participants share an email
+        # (Jay as agent + landlord). Field selector is best-effort; a miss
+        # surfaces at Send as the phone-required toast (fail-visible).
+        for psel in ("[data-testid='element-participant'] input[type='tel']",
+                     "[data-testid='phone-participant'] input"):
+            ph = page.locator(psel)
+            if ph.count():
+                ph.first.fill(sr["phone"], timeout=5_000)
+                ph.first.press("Tab")
+                page.wait_for_timeout(300)
+                break
     # Ensure the participant is a Signer (not Reviewer/Distribution).
     try:
         page.locator(S["participant_type"]).get_by_text("Signer", exact=True).first.click(timeout=3_000)
@@ -959,8 +976,13 @@ def _reconcile_participants(page, job):
             f"rows: {labels!r}")
 
     # 2. Landlord signer into the existing Landlord row (or a new one).
+    la_cfg = CONFIG.get("listing_agent") or {}
+    same_person = (ls.get("email", "").strip().lower()
+                   == la_cfg.get("email", "").strip().lower() != "")
     if ls.get("name"):
         sr = {"name": ls["name"], "email": ls.get("email", ""), "role": "Landlord"}
+        if same_person and la_cfg.get("phone"):
+            sr["phone"] = la_cfg["phone"]
         if edit_row_exact("Landlord (1)") or edit_row_exact("Landlord"):
             _fill_participant_dialog(page, sr, pick_role=False)
         else:
@@ -978,9 +1000,11 @@ def _reconcile_participants(page, job):
     if la.get("name"):
         for lbl in ("Listing Agent (1)", "Listing Agent"):
             if edit_row_exact(lbl):
-                _fill_participant_dialog(
-                    page, {"name": la["name"], "email": la.get("email", ""),
-                           "role": "Listing Agent"}, pick_role=False)
+                la_sr = {"name": la["name"], "email": la.get("email", ""),
+                         "role": "Listing Agent"}
+                if same_person and la.get("phone"):
+                    la_sr["phone"] = la["phone"]
+                _fill_participant_dialog(page, la_sr, pick_role=False)
                 break
 
     # 3. Remove every remaining UNASSIGNED row: known junk roles, the overlay's
