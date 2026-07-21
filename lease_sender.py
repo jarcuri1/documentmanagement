@@ -139,7 +139,7 @@ CONFIG = {
     # stamped on the PDF by lease_forms.
     "doc_overlays": {
         "disclosure-of-interest": "agnet disclosure_of_interest",
-        "lead-disclosure-rentals": "agent automated lead_rentals",
+        "lead-disclosure-rentals": "Agent Disclosure of Information on Lead-Based Paint and_or Lead-Based Paint Hazards (Rentals)",
     },
     "disclosure_checks": {
         "personal": ["item2_himself", "item3"],
