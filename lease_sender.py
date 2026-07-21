@@ -815,9 +815,12 @@ def _fill_participant_dialog(page, sr, pick_role=True):
                 ph.first.press("Tab")
                 page.wait_for_timeout(300)
                 break
-    # Ensure the participant is a Signer (not Reviewer/Distribution).
+    # Participant type: Signer by default; the from-scratch Listing Agent is
+    # Distribution (his signatures are pre-stamped on the PDFs — a Signer with
+    # zero fields blocks the send with 'add at least one field to sign').
     try:
-        page.locator(S["participant_type"]).get_by_text("Signer", exact=True).first.click(timeout=3_000)
+        ptype = sr.get("ptype", "Signer")
+        page.locator(S["participant_type"]).get_by_text(ptype, exact=True).first.click(timeout=3_000)
     except Exception:
         pass
     page.click(S["participant_save"], timeout=t)
@@ -1033,7 +1036,7 @@ def _reconcile_participants(page, job):
             page.click(S["add_participant_btn"], timeout=t)
             page.wait_for_timeout(1000)
             la_sr = {"name": la["name"], "email": la.get("email", ""),
-                     "role": "Listing Agent"}
+                     "role": "Listing Agent", "ptype": "Distribution"}
             if same_person and la.get("phone"):
                 la_sr["phone"] = la["phone"]
             _fill_participant_dialog(page, la_sr)
