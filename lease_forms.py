@@ -162,10 +162,48 @@ def fill_disclosure_of_interest(data, out_pdf):
     return str(out_pdf)
 
 
+def fill_lead_disclosure_rentals(data, out_pdf):
+    """Pre-fill the federal lead-paint disclosure (RENTALS version, flat PDF):
+      - (e) agent's acknowledgment initials (Jay is the lessor's agent)
+      - Lessor's Agent signature line: signature image (when provided) + date
+      - Address of Property/Unit at the bottom
+    Landlord initials ((a)(ii)/(b)(ii) + signature) and tenant initials
+    ((c)(ii)/(d) + signatures) are e-sign fields from the SmartMLS overlay
+    'agent automated lead_rentals' — people must initial their own statements.
+    Replaces the old Sign template, which was the SALES version of the form."""
+    tpl = _TEMPLATE_DIR / "lead_disclosure_rentals.pdf"
+    if not tpl.exists():
+        raise LeaseFormError(f"Lead disclosure (rentals) template not found: {tpl}")
+    from datetime import date as _date
+    today = f"{_date.today().month}/{_date.today().day}/{_date.today().year}"
+    doc = fitz.open(str(tpl))
+    pg = doc[0]
+    # (e) — Lessor's Agent has informed the lessor of their obligations
+    pg.insert_text((60, 479), LICENSEE_INITIALS, fontname="helv", fontsize=10, color=(0, 0, 0))
+    # Certification row 3: Lessor's Agent signature (x24-155) + Date (x156-281)
+    if _LICENSEE_SIG.exists():
+        pg.insert_image(fitz.Rect(28, 618, 150, 648), filename=str(_LICENSEE_SIG),
+                        keep_proportion=True)
+    pg.insert_text((162, 646), today, fontname="helv", fontsize=10, color=(0, 0, 0))
+    # Address of Property/Unit (bottom line)
+    pg.insert_text((30, 681), data["premises_address"], fontname="helv",
+                   fontsize=10, color=(0, 0, 0))
+    Path(out_pdf).parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out_pdf))
+    doc.close()
+    chk = fitz.open(str(out_pdf))
+    txt = chk[0].get_text()
+    chk.close()
+    if data["premises_address"].split(",")[0] not in txt or LICENSEE_INITIALS not in txt:
+        raise LeaseFormError("Lead disclosure (rentals): stamps did not land")
+    return str(out_pdf)
+
+
 # Registry of fillable supporting forms. Add (name, filler_fn) to expand.
 SUPPORTING_FORMS = [
     ("rental-terms-summary", fill_rental_terms_summary),
     ("disclosure-of-interest", fill_disclosure_of_interest),
+    ("lead-disclosure-rentals", fill_lead_disclosure_rentals),
 ]
 
 

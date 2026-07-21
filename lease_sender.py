@@ -115,9 +115,11 @@ CONFIG = {
     # its fill-in boxes are canvas-drawn and reject synthetic input, so
     # lease_forms.fill_disclosure_of_interest pre-fills the PDF (address +
     # licensee initials per property tree) and it rides as an UPLOAD.
+    # Lead disclosure: the Sign template was the SALES version — replaced by
+    # the pre-filled RENTALS PDF upload (lease_forms.fill_lead_disclosure_rentals)
+    # + the 'agent automated lead_rentals' overlay for landlord/tenant fields.
     "packet_templates": [
         "protectyourfamily_pamphlet_2026_3 Lead",
-        "Disclosure of Information on Lead-Based Paint and/or Lead-Based Paint Hazards (Rentals)",
     ],
     # Role base-names to KEEP when adding a packet template (checkboxes in the
     # template's Role Options dialog). Anything else (Buyer, Seller, Licensee,
@@ -137,6 +139,7 @@ CONFIG = {
     # stamped on the PDF by lease_forms.
     "doc_overlays": {
         "disclosure-of-interest": "agnet disclosure_of_interest",
+        "lead-disclosure-rentals": "agent automated lead_rentals",
     },
     "disclosure_checks": {
         "personal": ["item2_himself", "item3"],
