@@ -127,7 +127,13 @@ CONFIG = {
     "template_keep_roles": ["Tenant", "Landlord", "Listing Agent"],
     # The listing agent signs wherever a template carries that role (e.g. the
     # lead-paint disclosure's agent certification) — always Jason Arcuri.
-    "listing_agent": {"name": "Jason Arcuri", "email": "premiopropertymanagement@gmail.com", "phone": "2039107602"},
+    # Jay is always the listing agent; WHICH inbox he signs from depends on
+    # who the landlord is (his rule, 2026-07-21): Jay-as-landlord -> both
+    # roles at realtorarcuri (shared email + phones); Matt-as-landlord ->
+    # Matt at realtorarcuri, Jay-as-agent at premiopropertymanagement.
+    "listing_agent": {"name": "Jason Arcuri", "phone": "2039107602",
+                      "email_when_self": "realtorarcuri@gmail.com",
+                      "email_when_other": "premiopropertymanagement@gmail.com"},
     # Checkboxes to tick on the Disclosure of Interest, by management tree
     # (Jay 2026-07-19): owned properties -> '2: Himself or herself' + item 3;
     # Premio-managed -> item 3 only. Tree comes from the job or the folder map;
@@ -399,6 +405,19 @@ def step(auditor: Auditor, label: str, fn):
             raise StepFailure(f"Step failed: {label} — {e}") from e
 
 
+def listing_agent_for(job: dict) -> dict:
+    """The listing agent (always Jason) with the inbox chosen by WHO the
+    landlord signer is: Jay himself -> realtorarcuri on both roles
+    (same_person=True, phones fill); anyone else (Matt, a client) ->
+    premiopropertymanagement for the agent."""
+    la = dict(CONFIG.get("listing_agent") or {})
+    lname = ((job.get("landlord_signer") or {}).get("name") or "").lower()
+    self_signs = ("jason" in lname) or ("jay" in lname.split())
+    la["email"] = la.get("email_when_self") if self_signs else la.get("email_when_other")
+    la["same_person"] = self_signs
+    return la
+
+
 def signers_of(job: dict) -> list:
     """The lease's TENANT signers. Supports the multi-signer contract and the
     legacy single-tenant shape so older job files still work."""
@@ -445,11 +464,12 @@ def load_job(path: Path) -> dict:
     emails = [s["email"].strip().lower() for s in signers]
     if ls and ls.get("email"):
         emails.append(ls["email"].strip().lower())
-    la_email = (CONFIG.get("listing_agent") or {}).get("email", "")
+    la_dyn = listing_agent_for(job)
+    la_email = la_dyn.get("email") or ""
     if la_email:
         emails.append(la_email.strip().lower())   # the listing agent signs too
     dupes = sorted({e for e in emails if emails.count(e) > 1})
-    la = (CONFIG.get("listing_agent") or {}).get("email", "").strip().lower()
+    la = la_email.strip().lower()
     # Jay may be agent AND landlord on the same signing (SmartMLS accepts the
     # shared email when both participants carry a phone; reconcile fills it).
     if la and ls and (ls.get("email") or "").strip().lower() == la:
@@ -976,9 +996,8 @@ def _reconcile_participants(page, job):
             f"rows: {labels!r}")
 
     # 2. Landlord signer into the existing Landlord row (or a new one).
-    la_cfg = CONFIG.get("listing_agent") or {}
-    same_person = (ls.get("email", "").strip().lower()
-                   == la_cfg.get("email", "").strip().lower() != "")
+    la_cfg = listing_agent_for(job)
+    same_person = la_cfg.get("same_person", False)
     if ls.get("name"):
         sr = {"name": ls["name"], "email": ls.get("email", ""), "role": "Landlord"}
         if same_person and la_cfg.get("phone"):
@@ -996,7 +1015,7 @@ def _reconcile_participants(page, job):
     # 2b. Listing agent — fill any 'Listing Agent' row the templates created
     #     (Jay: 'make sure Jason Arcuri is in there as the listing agent no
     #     matter what').
-    la = CONFIG.get("listing_agent") or {}
+    la = la_cfg
     if la.get("name"):
         for lbl in ("Listing Agent (1)", "Listing Agent"):
             if edit_row_exact(lbl):
@@ -1291,7 +1310,7 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
         # The Signing Flow rows show name+role but not the email, so read each
         # participant's email back from its edit dialog (then Cancel — no change).
         approved = {s["email"].strip().lower() for s in all_signers(job) if s.get("email")}
-        la_email = (CONFIG.get("listing_agent") or {}).get("email", "")
+        la_email = listing_agent_for(job).get("email") or ""
         if la_email:
             approved.add(la_email.strip().lower())
         found = set()
