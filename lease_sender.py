@@ -328,9 +328,13 @@ def login_if_needed(page):
     S = SELECTORS
     dash, user = S["logged_in_marker"], S["sso_username"]
 
-    # Case A: already in?
+    # Case A: already in? The app shell can render the dashboard marker while
+    # its token check is still in flight, then bounce to /auth — so require the
+    # marker to survive a settle pause with no sign-in button on screen.
     if _wait_any(page, [dash], 5_000):
-        return
+        page.wait_for_timeout(3_000)
+        if page.locator(dash).count() and not page.locator(S["signin_with_mls_btn"]).count():
+            return
 
     # Get onto a login surface: click the propkit /auth button once it renders.
     if _wait_any(page, [S["signin_with_mls_btn"]], 10_000):
@@ -1252,6 +1256,11 @@ def run_signing(page, job: dict, auditor: Auditor, state: dict):
     lease_pdf = job["pdf_path"]
 
     def start_signing():
+        # A late auth bounce can land us on /auth after step 1 passed — recover
+        # instead of timing out on a button that no longer exists.
+        if page.locator(S["signin_with_mls_btn"]).count():
+            login_if_needed(page)
+            page.wait_for_selector(S["logged_in_marker"], timeout=t)
         page.click(S["new_signing_btn"], timeout=t)
         page.wait_for_selector(S["signing_name_input"], timeout=t)
         page.fill(S["signing_name_input"], job["signing_name"], timeout=t)
