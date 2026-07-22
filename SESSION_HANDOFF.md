@@ -1,121 +1,105 @@
-# SESSION HANDOFF — finish the lease automation on this PC + do a live test
+# SESSION HANDOFF — Lease Automation (updated 2026-07-22 morning)
 
-You are a Claude Code session running **locally on Jay's Windows fleet PC** with a
-real shell (C:\ and D:\). You're taking over a lease-automation build that was
-written in a separate cloud session. **All code is on GitHub.** Your goal RIGHT
-NOW: get it running on this PC and do a **live test run that drives SmartMLS Sign
-with fake data while Jay watches.** Start immediately with Step 1 below; pause
-only for the GUI steps marked **[JAY]**.
+Read this first, then `C:\Users\realt\.claude\projects\C--AIAgents\memory\MEMORY.md`
+(auto-loaded) and repo `SIGN_UI_MAP.md` for SmartMLS Sign mechanics.
 
-## START NOW — Step 1 (clone + install)
-Run these (Command Prompt). Report any error to Jay and fix before moving on.
-```
-cd /d C:\AIAgents
-git clone -b claude/lease-sender-automation-04ts0r https://github.com/jarcuri1/documentmanagement.git LeaseAgent
-cd LeaseAgent
-pip install playwright python-docx pymupdf google-api-python-client dropbox
-playwright install chrome
-```
-- If `pip` isn't found, use `py -m pip install ...`.
-- If `git` isn't found, the installer is in C:\Users\realt\Downloads (Git-*.exe).
-- Commit any code changes to branch `claude/lease-sender-automation-04ts0r` and push.
+## Who / where
+- Jay (realtor/property manager), fleet PC, user `realt`.
+- LeaseAgent: `C:\AIAgents\LeaseAgent` — repo jarcuri1/documentmanagement,
+  branch `claude/lease-sender-automation-04ts0r` (commit + push here).
+- Supervisor: `C:\AIAgents\supervisor\supervisor.js`, serves ONLY on
+  Tailscale IP `100.66.99.5:8787`. Restart: `schtasks /End /TN "Fleet Supervisor"`
+  then `/Run` (works from the sandbox, no admin).
+- Phone app: `C:\AIAgents\AIDashboard` (Expo 57, runtime 1.0.8, NOT a git repo).
+  OTA: `EAS_NO_VCS=1 NODE_OPTIONS=--max-old-space-size=4096 npx eas update
+  --channel preview --environment preview --platform android --non-interactive`.
+  Updates apply on the SECOND launch (double force-close).
+- Premio app: `C:\AIAgents\PremioApp` → github jarcuri1/premio-property-management
+  (main branch; push = Netlify auto-deploy to stalwart-truffle-2dd64a.netlify.app).
+- Leases data: `D:\Dropbox\Dropbox\Leases\{Intake,Pending,Sending,Sent,Failed,Audit,Signed}`.
 
-## Read these in the repo for full context
-- `DEPLOY_LEASE_AGENTS.md` — deploy + fleet wiring.
-- The docstring at the top of every `lease_*.py` — each explains its piece.
-- `HANDOFF_TO_SAMANTHA_AND_SUPERVISOR.md` — the fleet integration contracts.
+## STATE: everything works end-to-end, Jay approved the packet
+Full loop proven + approved 2026-07-21: app wizard → intake → packet fill
+(zero-shift lease + 3 pre-filled forms w/ Jay's initials/signature) → AUTO-send
+(no approval card for app intakes) → SmartMLS Sign assembly (overlays verified
+by field-count increase, template, 3-4 participants incl. dynamic listing-agent
+email rule) → sign → executed PDF auto-filed, old lease → `Past Tenants\`.
 
-## What this system does (one breath)
-`lease_intake.py` (interview) → `lease_fill.py` fills the Word lease + `lease_forms.py`
-auto-fills the CT Rental Terms Summary → approval card to Jay's phone → on approve
-`lease_watcher.py` claims the job → `lease_sender.py` drives **SmartMLS Sign**
-(upload lease + apply overlay + add 4 premade templates + add signers + send) →
-when signed, `lease_signed_watcher.py` pulls the executed PDF from Gmail and
-`lease_filer.py` files it into the right Dropbox property folder.
+Overlay bug that plagued runs 1-3 is FIXED: `_click_doc_gear` clicks the LAST
+gear (panel truncates names; text match hit the lease doc), and every overlay
+apply asserts total field count increases. Listing Agent is a SIGNER (his
+lead-form overlay fields exist now; Distribution can't own fields).
 
-## Environment facts (this PC)
-- Windows user `realt`. Dropbox root: **D:\Dropbox\Dropbox**. Fleet: **C:\AIAgents**.
-- LibreOffice INSTALLED at `C:\Program Files\LibreOffice\program\soffice.exe`
-  (converting works; the code auto-finds it).
-- SmartMLS Sign app: `https://signings.smartmls.propkit.io/signings` (via SmartMLS SSO).
-- Code defaults already point at these paths — no env vars needed on this PC.
+Hang-proofing (all committed): watcher caps sender at 25 min then tree-kills;
+sender self-watchdog aborts at 23 min; lease_pipeline reaps orphaned
+sender/chrome-profile processes older than cap (only the supervisor's elevated
+session can kill them — sandbox taskkill gets Access denied).
 
-## State: DONE vs TODO
-DONE: LibreOffice installed + converting.
-TODO (your job, in order):
-1. **[YOU]** Step 1 above (clone + pip install).
-2. **[JAY, browser]** `python lease_sender.py --setup` → a Chrome window opens on
-   the automation's own profile; Jay clicks "Sign in with Smart MLS", completes
-   SmartMLS login + MFA, lands on the Signings dashboard, closes the window.
-   (This is separate from Jay's normal browser login.)
-3. **[JAY, in Sign]** Finish the signature **overlay templates** in Sign, named
-   EXACTLY: `Agent automated single_family_lease` and
-   `Agent automated multi_family_lease`. Build them on the reference PDFs you
-   generate in the next line so alignment holds:
-   ```
-   "C:\Program Files\LibreOffice\program\soffice.exe" --headless -env:UserInstallation=file:///C:/temp/lo --convert-to pdf --outdir . templates\single_family_lease.docx
-   ```
-   (repeat for `templates\multi_family_lease.docx`). The lease fill guarantees
-   layout stability (`verify_layout_locked`), so overlays built on these PDFs stay
-   aligned on every filled lease.
-4. **[YOU + JAY] THE GATE — capture selectors.** Current `SELECTORS` in
-   `lease_sender.py` are PLACEHOLDERS; the sender fails on the first click until
-   this is done. Run:
-   ```
-   playwright codegen --user-data-dir="C:\AIAgents\LeaseAgent\chrome-profile" https://signings.smartmls.propkit.io/signings
-   ```
-   Have Jay walk ONE signing by hand: New Signing → name it → upload a PDF →
-   apply a template → add a signer (search existing contact + add a new one) →
-   Send. Capture each printed Playwright selector and edit the `SELECTORS` dict in
-   `lease_sender.py` — that dict is the ONLY place selectors live. Keys to fill:
-   `new_signing_btn, signing_name_input, create_btn, upload_input,
-   doc_uploaded_marker, templates_btn, template_row, apply_template_btn,
-   add_signer_btn, contact_search, contact_result, signer_name, signer_email,
-   signer_role, signer_save, remove_second_tenant, review_email_text, send_btn,
-   sent_confirmation, logged_in_marker`.
-5. **[YOU]** `python lease_folders_bootstrap.py` → open the draft
-   `C:\AIAgents\shared\lease_folders.json`, review with Jay, delete the `_review`
-   block.
-6. **[YOU + JAY] TEST RUN** (see below).
+## TENANT TURNOVER — built + deployed, NOT yet tested
+On signed-lease return, `lease_filer.file_signed_lease` now also calls
+`update_sheet_tenant`: POSTs the Premio app's `edit-tenant` with the job's
+exact sheet coords, writing tenant name(s)/rent/deposit to the master Google
+Sheet. It reads the row's PRIOR values first (undo trail in
+`job.sheet_update.previous`) and pushes success/failure.
 
-## The test run (Step 6)
-Use the fake intake below. First-time tip: to test the core flow before the 4
-supporting templates are confirmed, temporarily set `CONFIG["packet_templates"] = []`
-in `lease_sender.py`, get a clean run, then restore them.
-```
-python lease_intake.py        # answer with the fake data below
-```
-That writes an intake to `D:\Dropbox\Dropbox\Leases\Intake`. Then:
-```
-python lease_fill.py --drain  # fills lease + RTS, writes job + card to Pending
-python lease_sender.py --job "D:\Dropbox\Dropbox\Leases\Pending\<slug>.json"
-```
-The sender opens a visible Chrome and drives Sign. Watch it. If a step fails, it
-screenshots to `D:\Dropbox\Dropbox\Leases\Audit\...` and aborts — read the shot,
-fix the matching selector, retry.
+Data path: wizard payload `sheet_tab/sheet_property/sheet_unit`
+(NewLeaseScreen submit) → supervisor `intake.sheet {tab, property, unit}` →
+lease_fill job `sheet` + `rent/deposit/term_end_iso` → filer. Client leases /
+old app builds have no `sheet` → update silently skips.
+- sheet_property must be the sheet's VERBATIM column-A string, e.g.
+  `128 Walnut St, Naugatuck, CT 06770` (comes from prop.sheet.address).
+- `edit-tenant` was patched (deployed) to skip paymentMethod when omitted.
+- New function `add-property` (deployed): appends property row + unit rows.
 
-### Fake test data (single-family)
-- lease_type: single-family
-- Owner LLC (Landlord line): `MWC Real Estate LLC`
-- Landlord signer: `Matthew Como`, email `jarcuri1@hotmail.com` (reuse Jay's test inbox)
-- Property: `123 Test St, 1st Floor, Waterbury CT`; premises `123 Test St, 1st Floor, Waterbury, CT 06704`
-- Term: 2026-09-01 to 2027-08-31; rent 1500; deposit 1500
-- Utilities: City / Sewer / Gas
-- **Tenant 1:** name `Test Tenant One`, email `jarcuri1@hotmail.com`
-- **Tenant 2:** name `Test Tenant Two`, email `jarcuri1@gmail.com`
-  (Address/SSN are tenant-filled in Sign; leave blank.)
-- ONLY send to Jay's own inboxes above — never a real tenant during testing.
+## IMMEDIATE NEXT: full E2E test with 111 Test St
+Jay asked for a dedicated test property so NOTHING is skipped:
+1. DONE: folder `D:\Dropbox\Dropbox\Personal Properties\111 Test St Naugatuck`
+   + entry `111-test-st-naugatuck` in `C:\AIAgents\shared\lease_folders.json`.
+2. SHEET: Jay said HE will add it to Combined Empire (property row
+   `111 Test St, Naugatuck, CT 06770` in col A + unit row `Main` in col B).
+   CAUTION: my earlier `add-property` API call returned SUCCESS (unit Main,
+   tenant "Prior Tenant", $1,000/$1,000) but the CSV export never showed it —
+   VERIFY whether the rows exist before assuming; avoid duplicates.
+3. Restart supervisor after the sheet rows exist (1h sheet cache), confirm
+   `GET /api/lease/options` lists the property with sheet prefills.
+4. Jay submits a lease from the app wizard → auto-send → he signs all roles →
+   signed watcher files it → CHECK: PDF in the Test St folder, old lease
+   retirement, sheet row now shows the new tenant + before-values recorded in
+   the Sent job json (`sheet_update`), pushes received.
+5. Roll back the sheet row / delete test signing afterward.
 
-## Gotchas
-- `soffice` exits 0 even when it fails; the code verifies the PDF appears (handled).
-- The code launches soffice with an isolated `-env:UserInstallation` profile so
-  conversion works even if the LibreOffice Quickstarter is running.
-- `lease_sender` opens a HEADED Chrome — needs the interactive desktop (Jay's here).
-- Do NOT expect the sender to work before Step 4 (selectors).
-- Still-open integration items (NOT blockers for this test): Google Sheet →
-  auto-LLC lookup, the app-thread `kind:"lease"` card, and adding the 3 agents to
-  the supervisor. Do those after the test succeeds.
+## OPEN ISSUES right now
+- Phone app was crashing on New Lease + Settings tabs and main screen had
+  fetch errors AFTER the turnover OTA. Likely cause: Jay rebooted the PC —
+  phone Tailscale showed offline (fetch errors), plus a possibly half-applied
+  OTA. Fix path: reconnect phone Tailscale, double force-close app. If crashes
+  persist: republish previous good OTA group
+  `eas update:republish --group 2f4404fc-59c4-43bc-8bbf-ee4a66edf7aa`
+  (message "Require first+last names"). Current group:
+  2dfbfd54-8773-43c4-9b31-c982d2e33bfd.
+- Dropbox client NOT running after Jay's reboot (he closed programs — PC was
+  lagging). Pipeline unaffected (local paths) but no cloud sync. Jay may start
+  it himself; offer, don't force.
+- 128 Walnut test signing ("test bitches", jarcuri1@gmail.com) is OUT for
+  signing. When signed it will file but SKIP the sheet update (job predates
+  sheet coords) — Katelyn Goff's real row is safe.
+- Sign cleanup: many test drafts/signings for Jay to withdraw (his task).
 
-## Do this now
-Run Step 1. Report the clone + pip output. Then walk Jay through Step 2 and Step 4.
-```
+## LATER / NICE-TO-HAVE
+- Lease link into sheet col AA (edit-tenant leaseUrl) — needs a Dropbox API
+  token (LEASE_DROPBOX_TOKEN) to create shared links.
+- Move old tenant's lease inside the Premio app UI (folder move covers it).
+- Section-8 rent semantics for managed units (col F tenant vs col G total).
+- Advise Jay again: mortgage credentials live in the link-shared sheet.
+
+## GOTCHAS (cost hours — do not relearn)
+- Sign canvas fields REJECT synthetic input → pre-fill PDFs (lease_forms.py).
+- Documents panel truncates names → never text-match doc rows; last gear.
+- page.evaluate has NO timeout → the 3-layer watchdog above.
+- bash heredocs corrupt `\b` in JS regexes → use Write-tool patch scripts.
+- Supervisor answers ONLY on 100.66.99.5:8787 (not localhost).
+- soffice profiles must live in local temp (Dropbox sync corrupts them).
+- Never bump app version before OTA; OTA applies on second launch.
+- Auto-mode classifier blocks sender runs from the sandbox (Jay/fleet runs
+  them) and blocks deploying ad-hoc kill scripts — use the committed reaper.
+- Sheet mortgage-credential columns: NEVER parse or serve.
