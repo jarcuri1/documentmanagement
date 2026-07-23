@@ -173,7 +173,50 @@ def _money(v):
         return None
 
 
-def update_sheet_tenant(job, job_path=None):
+# Local Dropbox folder root — maps a filed path to its Dropbox-relative path.
+_DBX_LOCAL_ROOT = os.environ.get("LEASE_DROPBOX_LOCAL_ROOT", r"D:\Dropbox\Dropbox")
+
+
+def make_lease_url(local_pdf):
+    """Shared Dropbox link for a filed lease (sheet col AA -> the app's Lease
+    button). Auth: LEASE_DROPBOX_REFRESH_TOKEN + LEASE_DROPBOX_APP_KEY/
+    LEASE_DROPBOX_APP_SECRET (long-lived, preferred) or LEASE_DROPBOX_TOKEN
+    (raw access token — Dropbox expires these in ~4h). Degrades to '' —
+    filing and the sheet update never depend on it."""
+    try:
+        rel = "/" + str(Path(local_pdf).resolve().relative_to(
+            Path(_DBX_LOCAL_ROOT).resolve())).replace("\\", "/")
+    except ValueError:
+        return ""
+    token = os.environ.get("LEASE_DROPBOX_TOKEN", "")
+    refresh = os.environ.get("LEASE_DROPBOX_REFRESH_TOKEN", "")
+    if not (token or refresh):
+        return ""
+    try:
+        import dropbox
+        from dropbox.exceptions import ApiError
+    except ImportError:
+        print("WARN: `dropbox` package not installed — sheet omits leaseUrl")
+        return ""
+    try:
+        if refresh:
+            dbx = dropbox.Dropbox(
+                oauth2_refresh_token=refresh,
+                app_key=os.environ.get("LEASE_DROPBOX_APP_KEY", ""),
+                app_secret=os.environ.get("LEASE_DROPBOX_APP_SECRET", ""))
+        else:
+            dbx = dropbox.Dropbox(token)
+        try:
+            return dbx.sharing_create_shared_link_with_settings(rel).url
+        except ApiError:
+            links = dbx.sharing_list_shared_links(path=rel, direct_only=True).links
+            return links[0].url if links else ""
+    except Exception as e:
+        print(f"WARN: Dropbox share link failed ({e}) — sheet omits leaseUrl")
+        return ""
+
+
+def update_sheet_tenant(job, job_path=None, lease_url=""):
     """Write the new tenant onto Jay's master sheet via the Premio app's
     edit-tenant function, using the EXACT row strings the wizard captured
     (job['sheet'] = {tab, property, unit}). Reads the row's current values
@@ -195,6 +238,8 @@ def update_sheet_tenant(job, job_path=None):
         "leaseStart": job.get("term_start_iso", ""),
         "leaseEnd": job.get("term_end_iso", ""),
     }
+    if lease_url:
+        body["leaseUrl"] = lease_url
     try:
         previous = _read_sheet_row(body["sheetType"], sheet["property"], sheet["unit"])
     except Exception as e:
@@ -295,7 +340,8 @@ def file_signed_lease(signed_pdf, job, job_path=None):
     shutil.move(str(signed_pdf), str(dest))
 
     # Record what was filed back into the job record (so history is explicit).
-    filed = {"path": str(dest), "filename": dest.name,
+    lease_url = make_lease_url(dest)
+    filed = {"path": str(dest), "filename": dest.name, "url": lease_url or None,
              "retired": retired_names, "at": datetime.now().isoformat(timespec="seconds")}
     if job_path:
         try:
@@ -312,7 +358,7 @@ def file_signed_lease(signed_pdf, job, job_path=None):
 
     # Turnover: write the new tenant onto the master sheet (its own push;
     # failure never un-files the lease).
-    update_sheet_tenant(job, job_path=job_path)
+    update_sheet_tenant(job, job_path=job_path, lease_url=lease_url)
     return dest
 
 
