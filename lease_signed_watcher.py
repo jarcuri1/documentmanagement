@@ -54,6 +54,11 @@ CONFIG = {
     # Where the Email Agent keeps its Google OAuth files (reused read-only).
     "email_agent_dir": Path(os.environ.get("LEASE_EMAIL_AGENT_DIR", r"C:\AIAgents\EmailAgent")),
     "token_file": os.environ.get("LEASE_GMAIL_TOKEN", "token_premio.json"),
+    # All inboxes to search. Completion mail goes to every participant, and the
+    # only address on EVERY signing is realtorarcuri (listing-agent rule) — the
+    # premio inbox alone misses Jay-as-landlord jobs (found 2026-07-23).
+    "token_files": [t.strip() for t in os.environ.get(
+        "LEASE_GMAIL_TOKENS", "token_premio.json,token_realtor.json").split(",") if t.strip()],
     "gmail_query": os.environ.get("LEASE_GMAIL_QUERY", 'subject:"eSigning Completed" newer_than:30d'),
     "sent_dir": Path(os.environ.get("LEASE_SENT_DIR", str(Path(_LEASES_ROOT) / "Sent"))),
     "unfiled_dir": Path(os.environ.get("LEASE_UNFILED_DIR", str(Path(_LEASES_ROOT) / "Signed" / "_unfiled"))),
@@ -171,11 +176,11 @@ def _save_processed(ids):
 # ----------------------------------------------------------------------
 # Gmail (lazy imports so the pure core is testable without google libs)
 # ----------------------------------------------------------------------
-def _gmail_service():
+def _gmail_service(token_name=None):
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
     from googleapiclient.discovery import build
-    token = CONFIG["email_agent_dir"] / CONFIG["token_file"]
+    token = CONFIG["email_agent_dir"] / (token_name or CONFIG["token_file"])
     if not token.exists():
         raise RuntimeError(f"Gmail token not found: {token} (has the Email Agent authenticated?)")
     creds = Credentials.from_authorized_user_file(str(token), _GMAIL_SCOPES)
@@ -212,14 +217,30 @@ def _pdf_text(pdf_path):
 
 def process_once(dry_run=False):
     from lease_filer import file_signed_lease
-    service = _gmail_service()
     processed = _load_processed()
-    listed = service.users().messages().list(userId="me", q=CONFIG["gmail_query"], maxResults=25).execute()
-    msgs = listed.get("messages", [])
+    handled = 0
+    for token_name in CONFIG["token_files"]:
+        try:
+            service = _gmail_service(token_name)
+        except Exception as e:
+            print(f"[{token_name}] skipped: {e}", file=sys.stderr)
+            continue
+        acct = Path(token_name).stem
+        listed = service.users().messages().list(userId="me", q=CONFIG["gmail_query"], maxResults=25).execute()
+        msgs = listed.get("messages", [])
+        handled += _process_account(service, acct, msgs, processed, dry_run, file_signed_lease)
+    _save_processed(processed)
+    return handled
+
+
+def _process_account(service, acct, msgs, processed, dry_run, file_signed_lease):
     handled = 0
     for m in msgs:
         mid = m["id"]
-        if mid in processed:
+        # Legacy state entries are bare ids (premio-only era); new ones are
+        # account-prefixed since ids are per-mailbox.
+        key = f"{acct}:{mid}"
+        if mid in processed or key in processed:
             continue
         full = service.users().messages().get(userId="me", id=mid, format="full").execute()
         headers = {h["name"].lower(): h["value"] for h in full["payload"].get("headers", [])}
@@ -243,7 +264,7 @@ def process_once(dry_run=False):
             push("Signed lease needs filing",
                  f"'{name}' completed but no lease PDF found among attachments — file by hand.",
                  {"name": name})
-            processed.add(mid)
+            processed.add(key)
             continue
 
         CONFIG["work_dir"].mkdir(parents=True, exist_ok=True)
@@ -259,10 +280,14 @@ def process_once(dry_run=False):
             tmp.replace(dest)
             push("Signed lease needs filing",
                  f"Couldn't match '{name}' to a sent job — left in _unfiled.", {"name": name})
+        elif job.get("filed"):
+            # Sign emails one completion per role instance (and to every inbox
+            # we watch) — the job is already filed, so this is a duplicate copy.
+            tmp.unlink(missing_ok=True)
         else:
             file_signed_lease(tmp, job, job_path=str(jf))   # files it + retires old + pushes
 
-        processed.add(mid)
+        processed.add(key)
         handled += 1
 
     _save_processed(processed)
