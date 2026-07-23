@@ -54,18 +54,24 @@ def main():
     print(f"Storing {LABEL} credentials in Windows Credential Manager.")
     print("(These are used only for unattended re-login. Password input is hidden.)\n")
 
+    # --show echoes the password as you type (skips the confirm step too) —
+    # for when no one is around and you want to see what you're entering.
+    show = "--show" in sys.argv
+    ask = input if show else getpass.getpass
+
     username = input(f"{LABEL} username / email: ").strip()
     if not username:
         print("No username entered — aborting, nothing saved.")
         return
-    password = getpass.getpass(f"{LABEL} password (hidden): ")
+    password = ask(f"{LABEL} password{'' if show else ' (hidden)'}: ")
     if not password:
         print("No password entered — aborting, nothing saved.")
         return
-    confirm = getpass.getpass("Re-enter password to confirm: ")
-    if password != confirm:
-        print("Passwords did not match — aborting, nothing saved.")
-        return
+    if not show:
+        confirm = getpass.getpass("Re-enter password to confirm: ")
+        if password != confirm:
+            print("Passwords did not match — aborting, nothing saved.")
+            return
 
     keyring.set_password(SERVICE, USER_KEY, username)
     keyring.set_password(SERVICE, username, password)
