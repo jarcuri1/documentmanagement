@@ -144,11 +144,31 @@ def scrape_applications(page):
     }""")
 
 
+def _auto_alias(tt_property, aliases, folder_keys):
+    """Map a TenantTracks property name to a lease_folders key when the
+    slugified name prefixes exactly one key (e.g. '128 Walnut St' ->
+    '128-walnut-st-naugatuck'). Ambiguous or no match: leave unmapped —
+    Jay can add it to the registry's aliases by hand."""
+    if tt_property in aliases:
+        return
+    slug = re.sub(r"[^a-z0-9]+", "-", tt_property.lower()).strip("-")
+    if not slug:
+        return
+    hits = [k for k in folder_keys if k.startswith(slug)]
+    if len(hits) == 1:
+        aliases[tt_property] = hits[0]
+
+
 def pull(page, dry_run=False):
     rows = scrape_applications(page)
     cutoff = datetime.now() - timedelta(days=CONFIG["pull_days"])
     reg = load_registry()
     apps, aliases = reg["applicants"], reg.get("aliases", {})
+    try:
+        folder_keys = list(json.loads(
+            (_SHARED / "lease_folders.json").read_text(encoding="utf-8")).keys())
+    except Exception:
+        folder_keys = []
     newly_screened, added = [], 0
     for r in rows:
         try:
@@ -159,6 +179,7 @@ def pull(page, dry_run=False):
         if created < cutoff:
             continue
         status = "screened" if r["has_report"] else "invited"
+        _auto_alias(r["tt_property"], aliases, folder_keys)
         cur = apps.get(r["app_id"])
         if dry_run:
             print(f"[DRY-RUN] {r['app_id']} {r['tt_property']} ({r['city']}) "
@@ -231,12 +252,27 @@ def consume_queue(page, dry_run=False):
     qdir = CONFIG["queue_dir"]
     qdir.mkdir(parents=True, exist_ok=True)
     handled = 0
+    screened_any = False
+    pulled = False
     for f in sorted(qdir.glob("*.json")):
         try:
             job = json.loads(f.read_text(encoding="utf-8"))
         except Exception as e:
             print(f"bad queue file {f.name}: {e}", file=sys.stderr)
             f.rename(f.with_suffix(".json.bad"))
+            continue
+        # Jay's refresh button queues {"action": "pull"} — on-demand only,
+        # never scheduled (his rule: no constant rescanning).
+        if job.get("action") == "pull":
+            if dry_run:
+                print("[DRY-RUN] would pull applications")
+                continue
+            try:
+                pull(page)
+                pulled = True
+            finally:
+                f.unlink()
+            handled += 1
             continue
         who = ", ".join(a.get("email", "?") for a in job.get("applicants", []))
         if dry_run:
@@ -246,6 +282,7 @@ def consume_queue(page, dry_run=False):
             run_screening(page, job)
             f.unlink()
             handled += 1
+            screened_any = True
             push("Screening request sent",
                  f"{who} — {job.get('tt_property')}. Applicant pays; you'll be "
                  f"notified when they respond.", {"tt_property": job.get("tt_property")})
@@ -254,6 +291,13 @@ def consume_queue(page, dry_run=False):
             push("Screening request FAILED",
                  f"{who} @ {job.get('tt_property')}: {e}. Job set aside as .failed.",
                  {"tt_property": job.get("tt_property")})
+    # Browser's already open after a send — grab the fresh rows so the new
+    # invite shows in the app without Jay tapping refresh.
+    if screened_any and not pulled:
+        try:
+            pull(page)
+        except Exception as e:
+            print(f"post-send pull failed: {e}", file=sys.stderr)
     return handled
 
 
