@@ -176,6 +176,12 @@ def _money(v):
 # Local Dropbox folder root — maps a filed path to its Dropbox-relative path.
 _DBX_LOCAL_ROOT = os.environ.get("LEASE_DROPBOX_LOCAL_ROOT", r"D:\Dropbox\Dropbox")
 
+# Who may open lease links besides Jay (links are restricted, not public):
+# Matt Como's accounts, per Jay 2026-07-23.
+_LINK_VIEWERS = [e.strip() for e in os.environ.get(
+    "LEASE_LINK_VIEWERS",
+    "mattcomo87@gmail.com,mattcomocarpentry@gmail.com").split(",") if e.strip()]
+
 
 def make_lease_url(local_pdf):
     """Shared Dropbox link for a filed lease (sheet col AA -> the app's Lease
@@ -194,7 +200,6 @@ def make_lease_url(local_pdf):
         return ""
     try:
         import dropbox
-        from dropbox.exceptions import ApiError
     except ImportError:
         print("WARN: `dropbox` package not installed — sheet omits leaseUrl")
         return ""
@@ -206,14 +211,24 @@ def make_lease_url(local_pdf):
                 app_secret=os.environ.get("LEASE_DROPBOX_APP_SECRET", ""))
         else:
             dbx = dropbox.Dropbox(token)
-        from dropbox.sharing import SharedLinkSettings, RequestedVisibility
-        # Explicitly public: Jay's business partner opens these from the app.
-        settings = SharedLinkSettings(requested_visibility=RequestedVisibility.public)
-        try:
-            return dbx.sharing_create_shared_link_with_settings(rel, settings).url
-        except ApiError:
-            links = dbx.sharing_list_shared_links(path=rel, direct_only=True).links
-            return links[0].url if links else ""
+        from dropbox.sharing import (SharedLinkSettings, LinkAudience,
+                                     MemberSelector, AccessLevel)
+        # Restricted link: opens only for people with direct access to the
+        # file — Jay (owner) plus the viewers granted below.
+        settings = SharedLinkSettings(audience=LinkAudience.no_one)
+        # Reuse-first: creating over an existing link makes the SDK choke
+        # parsing the already-exists error when settings are attached.
+        links = dbx.sharing_list_shared_links(path=rel, direct_only=True).links
+        url = links[0].url if links else \
+            dbx.sharing_create_shared_link_with_settings(rel, settings).url
+        if url and _LINK_VIEWERS:
+            try:
+                dbx.sharing_add_file_member(
+                    rel, [MemberSelector.email(e) for e in _LINK_VIEWERS],
+                    quiet=True, access_level=AccessLevel.viewer)
+            except Exception as e:
+                print(f"WARN: could not grant lease-link viewers ({e})")
+        return url
     except Exception as e:
         print(f"WARN: Dropbox share link failed ({e}) — sheet omits leaseUrl")
         return ""
