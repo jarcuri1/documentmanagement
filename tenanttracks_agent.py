@@ -95,7 +95,7 @@ def save_registry(reg):
 # ----------------------------------------------------------------------
 def open_browser(p):
     ctx = p.chromium.launch_persistent_context(
-        str(CONFIG["profile_dir"]), headless=False,
+        str(CONFIG["profile_dir"]), channel="chrome", headless=False,
         args=["--disable-blink-features=AutomationControlled"])
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     return ctx, page
@@ -159,6 +159,22 @@ def _auto_alias(tt_property, aliases, folder_keys):
         aliases[tt_property] = hits[0]
 
 
+def scrape_properties(page):
+    """All TenantTracks properties (?page=properties: Name | Address | City) —
+    feeds the app's property picker so screening isn't limited to properties
+    that already have applicants."""
+    t = CONFIG["step_timeout_ms"]
+    page.goto(f"{CONFIG['app_url']}/report_smart?page=properties", timeout=t)
+    page.wait_for_selector("table", timeout=t)
+    return page.evaluate("""() => {
+      const rows = [...document.querySelectorAll('table tr')].slice(1);
+      return rows.map(r => {
+        const c = [...r.querySelectorAll('td')].map(td => td.innerText.trim());
+        return c.length >= 3 ? {name: c[0], address: c[1], city: c[2]} : null;
+      }).filter(x => x && x.name);
+    }""")
+
+
 def pull(page, dry_run=False):
     rows = scrape_applications(page)
     cutoff = datetime.now() - timedelta(days=CONFIG["pull_days"])
@@ -203,6 +219,14 @@ def pull(page, dry_run=False):
             newly_screened.append(cur)
     if dry_run:
         return 0
+    try:
+        props = scrape_properties(page)
+        if props:
+            reg["tt_properties"] = props
+            for pr in props:
+                _auto_alias(pr["name"], aliases, folder_keys)
+    except Exception as e:
+        print(f"property scrape failed (registry keeps old list): {e}", file=sys.stderr)
     save_registry(reg)
     for a in newly_screened:
         push("Screening complete",
@@ -227,10 +251,20 @@ def run_screening(page, job):
     # 1. payer — ALWAYS applicant pays
     page.click("text=Applicant Pays", timeout=t)
     page.click("text=Confirm", timeout=t)
-    # 2. property — existing only (add-new is a manual/TODO path)
+    # 2. property — fuzzy-match Jay's wording against the live dropdown
+    #    (he types from memory; 'walnut b' should find '128 Walnut B').
     prop = job["tt_property"]
     sel = page.locator("select").first
-    sel.select_option(label=prop)
+    options = sel.evaluate("el => [...el.options].map(o => o.label || o.text)")
+    norm = lambda s: re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+    want = norm(prop)
+    exact = [o for o in options if norm(o) == want]
+    loose = [o for o in options if want in norm(o) or norm(o) in want]
+    pick = exact[0] if exact else (loose[0] if len(loose) == 1 else None)
+    assert pick, (f"no TenantTracks property matches {prop!r} "
+                  f"(candidates: {loose[:5] if loose else 'none'}). Add it on "
+                  f"TenantTracks or use the exact name from the Applicants tab.")
+    sel.select_option(label=pick)
     page.click("text=Choose property", timeout=t)
     # 3. Option 1 form
     page.click("text=Option 1: Send Background check request", timeout=t)
