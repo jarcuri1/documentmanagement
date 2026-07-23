@@ -101,16 +101,33 @@ def open_browser(p):
     return ctx, page
 
 
+# Logged-in marker: the nav shows "Run Background Check" on every app page.
+_APP_MARKER = "a:has-text('Run Background Check')"
+_LOGIN_MARKER = "input[type='password']"
+
+
 def login_if_needed(page):
-    """Land on the dashboard; if bounced to /user/login, sign in from the
-    stored credentials (Remember me ticked). Same abort contract as the
-    lease sender: assert with a human-actionable message."""
+    """Land on the dashboard; the SPA can client-side-bounce to /user/login
+    well after load, so wait until either the login form or the app nav is
+    actually on screen. Sign in from stored credentials when needed."""
     t = CONFIG["step_timeout_ms"]
-    page.goto(f"{CONFIG['app_url']}/report_smart", timeout=t)
-    page.wait_for_load_state("domcontentloaded")
-    page.wait_for_timeout(1500)
-    if "/user/login" not in page.url:
+    # /user/login is the reliable entry: logged-out shows the form, logged-in
+    # redirects into the app. (/report_smart while logged out bounces to the
+    # MARKETING site tenanttracks.com, showing neither.)
+    page.goto(f"{CONFIG['app_url']}/user/login", timeout=t)
+    state = None
+    deadline = time.time() + t / 1000.0
+    while time.time() < deadline:
+        if page.locator(_LOGIN_MARKER).count():
+            state = "login"; break
+        if page.locator(_APP_MARKER).count():
+            state = "app"; break
+        page.wait_for_timeout(500)
+    if state == "app":
         return
+    assert state == "login", (
+        f"TenantTracks showed neither the app nor a login form ({page.url}) — "
+        "site down or flow changed.")
     username, password = get_credentials()
     assert username and password, (
         "TenantTracks login required and no stored credentials. Run "
@@ -122,20 +139,38 @@ def login_if_needed(page):
     except Exception:
         pass
     page.click("button:has-text('Log in')", timeout=t)
-    page.wait_for_url(re.compile(r"report_smart"), timeout=t)
+    page.wait_for_selector(_APP_MARKER, timeout=t)
+
+
+def goto_app_page(page, url, marker):
+    """goto + wait for the page's own marker; if the session lapsed and we
+    got bounced to the login page instead, log in and retry once."""
+    t = CONFIG["step_timeout_ms"]
+    page.goto(url, timeout=t)
+    try:
+        page.wait_for_selector(marker, timeout=10_000)
+        return
+    except Exception:
+        pass
+    if page.locator(_LOGIN_MARKER).count() or "/user/login" in page.url:
+        login_if_needed(page)
+        page.goto(url, timeout=t)
+    page.wait_for_selector(marker, timeout=t)
 
 
 # ----------------------------------------------------------------------
 # PULL — scrape ?page=applications into the registry
 # ----------------------------------------------------------------------
 def scrape_applications(page):
-    t = CONFIG["step_timeout_ms"]
-    page.goto(f"{CONFIG['app_url']}/report_smart?page=applications", timeout=t)
-    page.wait_for_selector("table", timeout=t)
+    goto_app_page(page, f"{CONFIG['app_url']}/report_smart?page=applications", "table")
+    # Cells carry their column label inline ("Application Created: 07/23...")
+    # — strip the known labels, nothing else (emails/timestamps contain ':').
     return page.evaluate("""() => {
+      const strip = s => s.replace(
+        /^(Property Name|Property City|Application ID|Application Created|Applicant Email|Applicant Name)\\s*:\\s*/i, '');
       const rows = [...document.querySelectorAll('table tr')].slice(1);
       return rows.map(r => {
-        const c = [...r.querySelectorAll('td')].map(td => td.innerText.trim());
+        const c = [...r.querySelectorAll('td')].map(td => strip(td.innerText.trim()));
         if (c.length < 6) return null;
         return {tt_property: c[0], city: c[1], app_id: c[2], created: c[3],
                 email: c[4], name: c[5] || null,
@@ -163,13 +198,12 @@ def scrape_properties(page):
     """All TenantTracks properties (?page=properties: Name | Address | City) —
     feeds the app's property picker so screening isn't limited to properties
     that already have applicants."""
-    t = CONFIG["step_timeout_ms"]
-    page.goto(f"{CONFIG['app_url']}/report_smart?page=properties", timeout=t)
-    page.wait_for_selector("table", timeout=t)
+    goto_app_page(page, f"{CONFIG['app_url']}/report_smart?page=properties", "table")
     return page.evaluate("""() => {
+      const strip = s => s.replace(/^(Name|Address|City)\\s*:\\s*/i, '');
       const rows = [...document.querySelectorAll('table tr')].slice(1);
       return rows.map(r => {
-        const c = [...r.querySelectorAll('td')].map(td => td.innerText.trim());
+        const c = [...r.querySelectorAll('td')].map(td => strip(td.innerText.trim()));
         return c.length >= 3 ? {name: c[0], address: c[1], city: c[2]} : null;
       }).filter(x => x && x.name);
     }""")
@@ -247,7 +281,8 @@ def run_screening(page, job):
     for a in applicants:
         a.setdefault("phone", "2035550100")   # Jay's rule: fake number when unknown
 
-    page.goto(f"{CONFIG['app_url']}/report_smart?page=new", timeout=t)
+    goto_app_page(page, f"{CONFIG['app_url']}/report_smart?page=new",
+                  "text=Applicant Pays")
     # 1. payer — ALWAYS applicant pays
     page.click("text=Applicant Pays", timeout=t)
     page.click("text=Confirm", timeout=t)
