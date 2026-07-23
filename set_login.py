@@ -20,7 +20,15 @@ import getpass
 
 import keyring
 
-SERVICE = "LeaseAgent-SmartMLS"
+# --service tenanttracks stores TenantTracks credentials instead (used by
+# tenanttracks_agent.py); default remains SmartMLS for lease_sender.py.
+_SERVICES = {
+    "smartmls": ("LeaseAgent-SmartMLS", "SmartMLS"),
+    "tenanttracks": ("LeaseAgent-TenantTracks", "TenantTracks"),
+}
+_pick = "tenanttracks" if "--service" in sys.argv and \
+    sys.argv[sys.argv.index("--service") + 1].lower() == "tenanttracks" else "smartmls"
+SERVICE, LABEL = _SERVICES[_pick]
 USER_KEY = "__username__"
 
 
@@ -35,7 +43,7 @@ def clear():
         keyring.delete_password(SERVICE, USER_KEY)
     except keyring.errors.PasswordDeleteError:
         pass
-    print("Cleared stored SmartMLS credentials.")
+    print(f"Cleared stored {LABEL} credentials.")
 
 
 def main():
@@ -43,14 +51,14 @@ def main():
         clear()
         return
 
-    print("Storing SmartMLS credentials in Windows Credential Manager.")
+    print(f"Storing {LABEL} credentials in Windows Credential Manager.")
     print("(These are used only for unattended re-login. Password input is hidden.)\n")
 
-    username = input("SmartMLS username / email: ").strip()
+    username = input(f"{LABEL} username / email: ").strip()
     if not username:
         print("No username entered — aborting, nothing saved.")
         return
-    password = getpass.getpass("SmartMLS password (hidden): ")
+    password = getpass.getpass(f"{LABEL} password (hidden): ")
     if not password:
         print("No password entered — aborting, nothing saved.")
         return

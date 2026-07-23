@@ -19,9 +19,13 @@ from pathlib import Path
 HERE = Path(__file__).parent
 
 STAGES = [
-    ("fill",  ["lease_fill.py", "--drain"]),
-    ("send",  ["lease_watcher.py", "--once"]),
-    ("file",  ["lease_signed_watcher.py"]),
+    ("fill",   ["lease_fill.py", "--drain"]),
+    ("send",   ["lease_watcher.py", "--once"]),
+    ("file",   ["lease_signed_watcher.py"]),
+    # Queued TenantTracks screening requests (exits instantly when the queue
+    # is empty — no browser opened). The 30-min applications PULL runs as its
+    # own fleet agent ("screening"), not here.
+    ("screen", ["tenanttracks_agent.py", "--queue"]),
 ]
 
 
