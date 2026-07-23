@@ -206,8 +206,11 @@ def make_lease_url(local_pdf):
                 app_secret=os.environ.get("LEASE_DROPBOX_APP_SECRET", ""))
         else:
             dbx = dropbox.Dropbox(token)
+        from dropbox.sharing import SharedLinkSettings, RequestedVisibility
+        # Explicitly public: Jay's business partner opens these from the app.
+        settings = SharedLinkSettings(requested_visibility=RequestedVisibility.public)
         try:
-            return dbx.sharing_create_shared_link_with_settings(rel).url
+            return dbx.sharing_create_shared_link_with_settings(rel, settings).url
         except ApiError:
             links = dbx.sharing_list_shared_links(path=rel, direct_only=True).links
             return links[0].url if links else ""
