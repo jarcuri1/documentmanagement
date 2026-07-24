@@ -321,7 +321,10 @@ def run_screening(page, job):
     # next to the "I confirm I have read" text, NEVER the first on the page.
     cb = page.locator("input[type='checkbox']:near(:text('I confirm I have read'))").first
     cb.check(timeout=t)
-    page.click("text=Submit Application", timeout=t)
+    # Submit is an <a> that's only VISIBLE while the box is checked. NEVER
+    # text=Submit Application here: the label "(required to submit
+    # application)" substring-matches first, and clicking it UNCHECKS the box.
+    page.locator('a:text-is("Submit Application")').first.click(timeout=t)
     page.wait_for_selector("text=The application has been saved", timeout=t)
 
 
@@ -364,6 +367,8 @@ def consume_queue(page, dry_run=False):
                  f"{who} — {job.get('tt_property')}. Applicant pays; you'll be "
                  f"notified when they respond.", {"tt_property": job.get("tt_property")})
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             f.rename(f.with_suffix(".json.failed"))
             push("Screening request FAILED",
                  f"{who} @ {job.get('tt_property')}: {e}. Job set aside as .failed.",
