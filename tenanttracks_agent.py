@@ -282,10 +282,14 @@ def run_screening(page, job):
         a.setdefault("phone", "2035550100")   # Jay's rule: fake number when unknown
 
     goto_app_page(page, f"{CONFIG['app_url']}/report_smart?page=new",
-                  "text=Applicant Pays")
-    # 1. payer — ALWAYS applicant pays
-    page.click("text=Applicant Pays", timeout=t)
-    page.click("text=Confirm", timeout=t)
+                  'text="Applicant Pays"')
+    # 1. payer — ALWAYS applicant pays. EXACT text matches only: the intro
+    # paragraph also contains the words "Applicant Pays"/"Confirm", and a
+    # bare text= selector clicks the paragraph instead of the button.
+    page.click('text="Applicant Pays"', timeout=t)
+    page.wait_for_timeout(500)
+    page.click('text="Confirm"', timeout=t)
+    page.wait_for_selector("select", timeout=t)
     # 2. property — fuzzy-match Jay's wording against the live dropdown
     #    (he types from memory; 'walnut b' should find '128 Walnut B').
     prop = job["tt_property"]
@@ -300,7 +304,7 @@ def run_screening(page, job):
                   f"(candidates: {loose[:5] if loose else 'none'}). Add it on "
                   f"TenantTracks or use the exact name from the Applicants tab.")
     sel.select_option(label=pick)
-    page.click("text=Choose property", timeout=t)
+    page.click('text="Choose property"', timeout=t)
     # 3. Option 1 form
     page.click("text=Option 1: Send Background check request", timeout=t)
     for i, a in enumerate(applicants):
@@ -312,7 +316,11 @@ def run_screening(page, job):
         emails.nth(i).fill(a["email"])
         retypes.nth(i).fill(a["email"])
         phones.nth(i).fill(a["phone"])
-    page.check("input[type='checkbox']", timeout=t)   # required confirm box
+    # The whole flow is ONE page (anchored sections), so the MA criminal
+    # add-on checkbox from step 1 is also in the DOM — scope to the checkbox
+    # next to the "I confirm I have read" text, NEVER the first on the page.
+    cb = page.locator("input[type='checkbox']:near(:text('I confirm I have read'))").first
+    cb.check(timeout=t)
     page.click("text=Submit Application", timeout=t)
     page.wait_for_selector("text=The application has been saved", timeout=t)
 
