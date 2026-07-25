@@ -273,6 +273,71 @@ def pull(page, dry_run=False):
 
 # ----------------------------------------------------------------------
 # SCREEN — drive the Option-1 request for queued jobs
+def _derive_property_details(typed):
+    """Best-effort details for TT's 'Add New Property' form. Sources, in
+    order: the master sheet via the supervisor's lease options (fuzzy match
+    on the typed name), then whatever Jay typed ('street, town zip').
+    Returns None when no city could be worked out (form requires it)."""
+    import urllib.request
+    norm = lambda s: re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+    street = typed.split(",")[0].strip()
+    details = {"name": street, "address": street, "city": "", "zip": "",
+               "deposit": "1000", "rent": "1000"}
+    if "," in typed:
+        rest = typed.split(",", 1)[1]
+        m = re.search(r"(\d{5})", rest)
+        if m:
+            details["zip"] = m.group(1)
+        details["city"] = re.sub(r"\bCT\b|\d{5}", "", rest, flags=re.I).strip(" ,")
+    try:
+        base = os.environ.get("SUPERVISOR_URL", "http://100.66.99.5:8787")
+        with urllib.request.urlopen(f"{base}/api/lease/options", timeout=30) as r:
+            props = json.loads(r.read().decode()).get("properties", [])
+    except Exception:
+        props = []
+    want = norm(street)
+    best = next((p for p in props if want and want in norm(
+        (p.get("sheet_address") or "") + " " + (p.get("label") or ""))), None)
+    if best:
+        sa = best.get("sheet_address") or ""
+        parts = [x.strip() for x in sa.split(",") if x.strip()]
+        if parts:
+            details["address"] = parts[0]
+            details["name"] = parts[0]   # short street name, TT convention
+        if len(parts) > 1 and not details["city"]:
+            details["city"] = re.sub(r"\bCT\b|\d{5}", "", parts[1], flags=re.I).strip(" ,")
+        if not details["city"] and best.get("town"):
+            details["city"] = best["town"]
+        m = re.search(r"(\d{5})", sa)
+        if m and not details["zip"]:
+            details["zip"] = m.group(1)
+        units = (best.get("sheet") or {}).get("units") or []
+        if units:
+            digits = lambda v: re.sub(r"[^0-9]", "", str(v or ""))
+            if digits(units[0].get("rent")):
+                details["rent"] = digits(units[0]["rent"])
+            if digits(units[0].get("deposit")):
+                details["deposit"] = digits(units[0]["deposit"])
+    return details if details["city"] else None
+
+
+def _create_property(page, details):
+    """Fill and save TT's Add New Property form (state stays Connecticut;
+    marketplace visibility and the $49.99 MA-records add-on stay 'No')."""
+    t = CONFIG["step_timeout_ms"]
+    page.fill("input[placeholder='Property Name']", details["name"])
+    page.fill("input[placeholder='Property Address']", details["address"])
+    page.fill("input[placeholder='Property City']", details["city"])
+    if details["zip"]:
+        page.fill("input[placeholder='Postal Code']", details["zip"])
+    page.fill("input[placeholder='Security Deposit']", details["deposit"])
+    page.fill("input[placeholder='Rent Amount']", details["rent"])
+    page.locator('button:has-text("Save Property"), a:text-is("Save Property")') \
+        .first.click(timeout=t)
+    # Saving drops us on the same step-3 panel as "Choose property" does.
+    page.wait_for_selector("text=Option 1: Send Background check request", timeout=t)
+
+
 # ----------------------------------------------------------------------
 def run_screening(page, job):
     t = CONFIG["step_timeout_ms"]
@@ -300,11 +365,21 @@ def run_screening(page, job):
     exact = [o for o in options if norm(o) == want]
     loose = [o for o in options if want in norm(o) or norm(o) in want]
     pick = exact[0] if exact else (loose[0] if len(loose) == 1 else None)
-    assert pick, (f"no TenantTracks property matches {prop!r} "
-                  f"(candidates: {loose[:5] if loose else 'none'}). Add it on "
-                  f"TenantTracks or use the exact name from the Applicants tab.")
-    sel.select_option(label=pick)
-    page.click('text="Choose property"', timeout=t)
+    if pick:
+        sel.select_option(label=pick)
+        page.click('text="Choose property"', timeout=t)
+    else:
+        # Unknown property — create it on TenantTracks (Jay's rule: deduce,
+        # and if you can't, make the property rather than fail).
+        assert len(loose) <= 1, (
+            f"{prop!r} is ambiguous on TenantTracks: {loose[:5]} — use one of "
+            "those exact names.")
+        details = _derive_property_details(prop)
+        assert details, (
+            f"no TenantTracks property matches {prop!r} and I couldn't work "
+            "out its address/town/zip from the sheet — retype it as "
+            "'street, town zip' (e.g. '29 Evans St, Waterbury 06705').")
+        _create_property(page, details)
     # 3. Option 1 form
     page.click("text=Option 1: Send Background check request", timeout=t)
     for i, a in enumerate(applicants):
