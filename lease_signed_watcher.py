@@ -215,10 +215,126 @@ def _pdf_text(pdf_path):
         return ""
 
 
+# ----------------------------------------------------------------------
+# Manual filing cards — when a completed signing matches no sent job, ask
+# Jay where it goes (Owned / Managed / Don't file -> property -> unit).
+# Card ids use the 'leasefile-' prefix: lease_watcher owns 'lease-' and
+# would otherwise eat our decisions.
+# ----------------------------------------------------------------------
+_FOLDERS_JSON = Path(_SHARED_ROOT) / "lease_folders.json"
+_CARDS_DIR = Path(_SHARED_ROOT) / "approvals" / "pending"
+_DECISIONS_DIR = Path(_SHARED_ROOT) / "approvals" / "decisions"
+
+
+def _folder_choices():
+    """lease_folders.json -> {'personal': [{key,label,units[]}], 'premio': [...]}"""
+    try:
+        mapping = json.loads(_FOLDERS_JSON.read_text(encoding="utf-8"))
+    except Exception:
+        return {"personal": [], "premio": []}
+    out = {"personal": [], "premio": []}
+    for key, e in sorted(mapping.items()):
+        tree = "premio" if e.get("tree") == "premio" else "personal"
+        label = Path(e.get("folder", key)).name
+        units = sorted(set((e.get("units") or {}).values()))
+        out[tree].append({"key": key, "label": label, "units": units})
+    return out
+
+
+def _guess_property(choices, signing_name, pdf_text):
+    """Cheap deduction: which property label's tokens appear in the signing
+    name or the lease text? First match wins; None when nothing does."""
+    hay = re.sub(r"[^a-z0-9]+", " ", f"{signing_name} {pdf_text}".lower())
+    for tree in ("personal", "premio"):
+        for p in choices[tree]:
+            toks = re.sub(r"[^a-z0-9]+", " ", p["label"].lower()).split()
+            # require the street number + first street word (e.g. "128 walnut")
+            if len(toks) >= 2 and f"{toks[0]} {toks[1]}" in hay:
+                return {"tree": tree, "property_key": p["key"]}
+    return None
+
+
+def _queue_filing_card(pdf_name, signing_name, pdf_text):
+    choices = _folder_choices()
+    cid = "leasefile-" + re.sub(r"[^a-z0-9]+", "-", signing_name.lower()).strip("-")[:40] \
+          + f"-{int(time.time())}"
+    card = {
+        "id": cid,
+        "agent": "lease",
+        "kind": "lease_file",
+        "created_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "title": f"Where does this lease go? — {signing_name}",
+        "subject": f"File signed lease: {signing_name}",
+        "body": (f"'{signing_name}' completed on SmartMLS Sign but doesn't match "
+                 f"any lease I sent, so I can't file it on my own. Tell me where "
+                 f"it belongs (or Don't file to leave it alone)."),
+        "actions": ["file", "skip"],
+        "fields": {
+            "pdf": pdf_name,
+            "signing_name": signing_name,
+            "guess": _guess_property(choices, signing_name, pdf_text),
+            "choices": choices,
+        },
+    }
+    _CARDS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _CARDS_DIR / (cid + ".json.tmp")
+    tmp.write_text(json.dumps(card, indent=2), encoding="utf-8")
+    tmp.replace(_CARDS_DIR / (cid + ".json"))
+
+
+def consume_filing_decisions():
+    """Act on decided filing cards (runs every pipeline tick, no Gmail/browser
+    needed). Decision text is JSON from the app: {pdf, property_key, unit,
+    label}."""
+    from lease_filer import file_signed_lease
+    handled = 0
+    if not _DECISIONS_DIR.exists():
+        return 0
+    for f in sorted(_DECISIONS_DIR.glob("leasefile-*.json")):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            info = json.loads(d.get("text") or "{}")
+        except Exception as e:
+            print(f"bad filing decision {f.name}: {e}", file=sys.stderr)
+            f.rename(f.with_suffix(".json.bad"))
+            continue
+        pdf = CONFIG["unfiled_dir"] / (info.get("pdf") or "")
+        action = d.get("action")
+        if action == "file" and info.get("property_key") and pdf.exists():
+            job = {
+                "property_key": info["property_key"],
+                "unit": info.get("unit", ""),
+                "filing_address": info.get("label") or info["property_key"],
+                "tenant_name": info.get("signing_name") or "Manual",
+                "term_start_iso": datetime.now().strftime("%Y-%m-%d"),
+            }
+            file_signed_lease(pdf, job)   # pushes its own "Lease filed"
+        elif action == "file":
+            push("Filing failed",
+                 f"Couldn't file '{info.get('pdf')}' — file missing or no "
+                 f"property picked. It's still in _unfiled.", {})
+        else:   # skip / Don't file
+            skipped = CONFIG["unfiled_dir"] / "skipped"
+            if pdf.exists():
+                skipped.mkdir(parents=True, exist_ok=True)
+                target = skipped / pdf.name
+                if target.exists():
+                    target = target.with_name(f"{target.stem}-{int(time.time())}{target.suffix}")
+                pdf.rename(target)
+        f.unlink()
+        handled += 1
+    return handled
+
+
 def process_once(dry_run=False):
     from lease_filer import file_signed_lease
     processed = _load_processed()
     handled = 0
+    try:
+        if not dry_run:
+            handled += consume_filing_decisions()
+    except Exception as e:
+        print(f"filing decisions error (continuing): {e}", file=sys.stderr)
     for token_name in CONFIG["token_files"]:
         try:
             service = _gmail_service(token_name)
@@ -273,13 +389,16 @@ def _process_account(service, acct, msgs, processed, dry_run, file_signed_lease)
 
         job, jf = correlate_job(name, CONFIG["sent_dir"], pdf_text=_pdf_text(tmp))
         if not job:
+            pdf_text = _pdf_text(tmp)
             CONFIG["unfiled_dir"].mkdir(parents=True, exist_ok=True)
             dest = CONFIG["unfiled_dir"] / lease_att["filename"]
             if dest.exists():
                 dest = dest.with_name(f"{dest.stem}-{int(time.time())}{dest.suffix}")
             tmp.replace(dest)
+            _queue_filing_card(dest.name, name, pdf_text)
             push("Signed lease needs filing",
-                 f"Couldn't match '{name}' to a sent job — left in _unfiled.", {"name": name})
+                 f"'{name}' doesn't match anything I sent — pick where it goes "
+                 f"on the filing card in the app.", {"name": name})
         elif job.get("filed"):
             # Sign emails one completion per role instance (and to every inbox
             # we watch) — the job is already filed, so this is a duplicate copy.
