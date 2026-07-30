@@ -317,11 +317,12 @@ def file_signed_lease(signed_pdf, job, job_path=None):
     prop_folder = entry["folder"]
     unit = str(job.get("unit", "")).strip()
 
-    # Destination: personal tree + a resolvable unit subfolder -> that
-    # subfolder; otherwise the property folder (unit rides in the filename,
-    # Premio-style).
+    # Destination: a resolvable unit subfolder -> that subfolder (any tree —
+    # some managed properties are structured too, e.g. 227 Whitewood's
+    # Bar/Laundromat/Moon Mart); otherwise the property folder (unit rides
+    # in the filename, flat-Premio-style).
     dest_folder = prop_folder
-    if entry.get("tree") == "personal" and unit:
+    if unit:
         sub = _resolve_unit_subfolder(entry, unit, prop_folder)
         if sub:
             dest_folder = os.path.join(prop_folder, sub)
