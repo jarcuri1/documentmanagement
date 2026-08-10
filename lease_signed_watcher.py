@@ -327,7 +327,7 @@ def consume_filing_decisions():
 
 
 def process_once(dry_run=False):
-    from lease_filer import file_signed_lease
+    from lease_filer import file_signed_lease, backfill_lease_urls
     processed = _load_processed()
     handled = 0
     try:
@@ -335,6 +335,11 @@ def process_once(dry_run=False):
             handled += consume_filing_decisions()
     except Exception as e:
         print(f"filing decisions error (continuing): {e}", file=sys.stderr)
+    try:
+        if not dry_run:
+            backfill_lease_urls(CONFIG["sent_dir"])
+    except Exception as e:
+        print(f"lease-url backfill error (continuing): {e}", file=sys.stderr)
     for token_name in CONFIG["token_files"]:
         try:
             service = _gmail_service(token_name)

@@ -218,9 +218,20 @@ def make_lease_url(local_pdf):
         settings = SharedLinkSettings(audience=LinkAudience.no_one)
         # Reuse-first: creating over an existing link makes the SDK choke
         # parsing the already-exists error when settings are attached.
-        links = dbx.sharing_list_shared_links(path=rel, direct_only=True).links
-        url = links[0].url if links else \
-            dbx.sharing_create_shared_link_with_settings(rel, settings).url
+        # The desktop client may still be uploading the just-moved PDF, so the
+        # cloud path can lag the local one — retry briefly before giving up
+        # (the watcher's backfill pass catches anything slower).
+        url = None
+        for attempt in range(3):
+            try:
+                links = dbx.sharing_list_shared_links(path=rel, direct_only=True).links
+                url = links[0].url if links else \
+                    dbx.sharing_create_shared_link_with_settings(rel, settings).url
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(20)
         if url and _LINK_VIEWERS:
             try:
                 dbx.sharing_add_file_member(
@@ -232,6 +243,52 @@ def make_lease_url(local_pdf):
     except Exception as e:
         print(f"WARN: Dropbox share link failed ({e}) — sheet omits leaseUrl")
         return ""
+
+
+def backfill_lease_urls(sent_dir, max_age_days=3):
+    """Heal recently filed jobs whose Dropbox share link failed at filing time
+    (cloud sync lagged the local move — the 168 Lucille lease hit this). For
+    each such job: create the link now and re-send the SAME sheet row values
+    plus leaseUrl, preserving the original before-values undo trail."""
+    import urllib.request
+    healed = 0
+    for jf in Path(sent_dir).glob("*.json"):
+        try:
+            rec = json.loads(jf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        filed = rec.get("filed") or {}
+        if not filed.get("path") or filed.get("url"):
+            continue
+        try:
+            age = datetime.now() - datetime.fromisoformat(filed.get("at", ""))
+            if age.days > max_age_days:
+                continue
+        except ValueError:
+            continue
+        url = make_lease_url(filed["path"])
+        if not url:
+            continue    # still not synced (or no token) — next tick retries
+        filed["url"] = url
+        body = None
+        upd = rec.get("sheet_update") or {}
+        if isinstance(upd.get("requested"), dict) and upd.get("response", {}).get("success"):
+            body = dict(upd["requested"], leaseUrl=url)
+            try:
+                req = urllib.request.Request(
+                    f"{_PREMIO_APP}/.netlify/functions/edit-tenant",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req, timeout=45) as r:
+                    if json.loads(r.read().decode("utf-8")).get("success"):
+                        upd["requested"]["leaseUrl"] = url
+                        upd["url_backfilled_at"] = datetime.now().isoformat(timespec="seconds")
+            except Exception as e:
+                print(f"WARN: leaseUrl backfill sheet post failed ({e})")
+        jf.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+        healed += 1
+        print(f"backfilled lease link: {jf.name}")
+    return healed
 
 
 def update_sheet_tenant(job, job_path=None, lease_url=""):
