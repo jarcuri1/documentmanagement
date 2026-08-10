@@ -42,6 +42,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -224,6 +225,9 @@ def _pdf_text(pdf_path):
 _FOLDERS_JSON = Path(_SHARED_ROOT) / "lease_folders.json"
 _CARDS_DIR = Path(_SHARED_ROOT) / "approvals" / "pending"
 _DECISIONS_DIR = Path(_SHARED_ROOT) / "approvals" / "decisions"
+_DONE_DIR = Path(_SHARED_ROOT) / "approvals" / "done"
+# Tenant-removal jobs the app queues via the supervisor (POST /api/tenant/remove)
+_REMOVALS_DIR = Path(_SHARED_ROOT) / "tenant_removals"
 
 
 def _folder_choices():
@@ -326,6 +330,151 @@ def consume_filing_decisions():
     return handled
 
 
+def consume_turnover_decisions():
+    """Act on decided Apartments.com payment cards (`aptpay-` prefix, written
+    by lease_filer.queue_turnover_card). Approve = queue the action job(s)
+    for the Apartments payments agent; the plan rides in the card payload,
+    which the supervisor moved to done\\ at decision time. This function
+    NEVER touches Apartments.com itself."""
+    from lease_filer import APT_LEASE_QUEUE
+    handled = 0
+    if not _DECISIONS_DIR.exists():
+        return 0
+    for f in sorted(_DECISIONS_DIR.glob("aptpay-*.json")):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            card = json.loads((_DONE_DIR / f"{d['id']}.json").read_text(encoding="utf-8"))
+            plan = card.get("fields") or {}
+        except Exception as e:
+            print(f"bad turnover decision {f.name}: {e}", file=sys.stderr)
+            f.rename(f.with_suffix(".json.bad"))
+            continue
+        where = plan.get("property", "?") + \
+            (f" / {plan['unit']}" if plan.get("unit") else "")
+        # The custom card sends 'approve'; the generic fallback card's
+        # buttons send 'send'/'done' — treat all three as yes.
+        if d.get("action") in ("approve", "send", "done") and plan.get("actions"):
+            APT_LEASE_QUEUE.mkdir(parents=True, exist_ok=True)
+            jf = APT_LEASE_QUEUE / f"{plan.get('kind','job')}-{int(time.time()*1000)}.json"
+            tmp = jf.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({**plan, "approved_at":
+                datetime.now().isoformat(timespec="seconds"),
+                "card_id": d["id"]}, indent=2), encoding="utf-8")
+            tmp.replace(jf)
+            push("Apartments.com job queued",
+                 f"{where}: approved — {', '.join(plan['actions'])}. The "
+                 f"payments agent will run it.", {"kind": "lease"})
+        else:
+            push("Apartments.com update skipped",
+                 f"{where}: no changes will be made.", {"kind": "lease"})
+        f.unlink()
+        handled += 1
+    return handled
+
+
+def consume_removals():
+    """Act on 'remove tenant completely' jobs from the app (written by the
+    supervisor's POST /api/tenant/remove). Steps: retire every current lease
+    PDF for the unit to Past Tenants\\, clear the sheet row (snapshotting
+    prior values first — reversible), and queue the Apartments.com payment
+    cancellation for the payments agent. Jay already confirmed in the app,
+    so no second approval card."""
+    import urllib.request
+    from lease_filer import (_read_sheet_row, _resolve_unit_subfolder,
+                             _PREMIO_APP, APT_LEASE_QUEUE)
+    handled = 0
+    if not _REMOVALS_DIR.exists():
+        return 0
+    done_dir = _REMOVALS_DIR / "done"
+    for f in sorted(_REMOVALS_DIR.glob("rm-*.json")):
+        try:
+            job = json.loads(f.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"bad removal job {f.name}: {e}", file=sys.stderr)
+            f.rename(f.with_suffix(".json.bad"))
+            continue
+        sheet = job.get("sheet") or {}
+        unit = str(job.get("unit", "")).strip()
+        tenant = job.get("tenant") or "the tenant"
+        where = (job.get("label") or job.get("property_key", "?")) + \
+            (f" / {unit}" if unit else "")
+
+        # 1) Retire current lease PDFs to Past Tenants\ (same rules as filing).
+        retired = []
+        try:
+            mapping = json.loads(_FOLDERS_JSON.read_text(encoding="utf-8"))
+            entry = mapping.get(job.get("property_key") or "")
+            if entry and entry.get("folder") and os.path.isdir(entry["folder"]):
+                prop_folder = entry["folder"]
+                dest_folder = prop_folder
+                if unit:
+                    sub = _resolve_unit_subfolder(entry, unit, prop_folder)
+                    if sub:
+                        dest_folder = os.path.join(prop_folder, sub)
+                past = Path(prop_folder) / "Past Tenants"
+                for name in os.listdir(dest_folder):
+                    if not (name.startswith("Lease - ") and name.lower().endswith(".pdf")):
+                        continue
+                    # No unit subfolder: only take this unit's leases by name.
+                    if unit and dest_folder == prop_folder and f" {unit} " not in name:
+                        continue
+                    past.mkdir(parents=True, exist_ok=True)
+                    target = past / name
+                    if target.exists():
+                        target = target.with_name(f"{target.stem}-{int(time.time())}.pdf")
+                    shutil.move(os.path.join(dest_folder, name), str(target))
+                    retired.append(name)
+        except Exception as e:
+            print(f"removal lease-retire failed for {where}: {e}", file=sys.stderr)
+
+        # 2) Clear the sheet row, previous values snapshotted into the record.
+        cleared, previous = False, {}
+        if sheet.get("property") and sheet.get("unit"):
+            try:
+                previous = _read_sheet_row(
+                    "owned" if sheet.get("tab") != "premio" else "premio",
+                    sheet["property"], sheet["unit"])
+            except Exception as e:
+                previous = {"unreadable": str(e)}
+            try:
+                body = {"sheetType": "owned" if sheet.get("tab") != "premio" else "premio",
+                        "propertyAddress": sheet["property"], "unitName": sheet["unit"],
+                        "tenantName": "", "clear": True}
+                req = urllib.request.Request(
+                    f"{_PREMIO_APP}/.netlify/functions/edit-tenant",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req, timeout=45) as r:
+                    cleared = bool(json.loads(r.read().decode("utf-8")).get("success"))
+            except Exception as e:
+                print(f"removal sheet clear failed for {where}: {e}", file=sys.stderr)
+
+        # 3) Queue the Apartments.com cancellation for the payments agent.
+        APT_LEASE_QUEUE.mkdir(parents=True, exist_ok=True)
+        qf = APT_LEASE_QUEUE / f"remove-{int(time.time()*1000)}.json"
+        tmp = qf.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({
+            "kind": "remove", "property": sheet.get("property") or job.get("label", ""),
+            "unit": unit, "old_tenant": tenant, "new_tenant": None,
+            "actions": ["cancel_old_payments", "end_old_residency"],
+            "queued_at": datetime.now().isoformat(timespec="seconds")},
+            indent=2), encoding="utf-8")
+        tmp.replace(qf)
+
+        job["result"] = {"retired": retired, "sheet_cleared": cleared,
+                         "previous": previous,
+                         "at": datetime.now().isoformat(timespec="seconds")}
+        done_dir.mkdir(parents=True, exist_ok=True)
+        f.replace(done_dir / f.name)
+        (done_dir / f.name).write_text(json.dumps(job, indent=2), encoding="utf-8")
+        push("Tenant removed",
+             f"{where}: {tenant} — {len(retired)} lease(s) to Past Tenants, "
+             f"sheet row {'cleared' if cleared else 'NOT cleared (do by hand)'}, "
+             f"Apartments.com payment cancel queued.", {"kind": "lease"})
+        handled += 1
+    return handled
+
+
 def process_once(dry_run=False):
     from lease_filer import file_signed_lease, backfill_lease_urls
     processed = _load_processed()
@@ -335,6 +484,16 @@ def process_once(dry_run=False):
             handled += consume_filing_decisions()
     except Exception as e:
         print(f"filing decisions error (continuing): {e}", file=sys.stderr)
+    try:
+        if not dry_run:
+            handled += consume_turnover_decisions()
+    except Exception as e:
+        print(f"turnover decisions error (continuing): {e}", file=sys.stderr)
+    try:
+        if not dry_run:
+            handled += consume_removals()
+    except Exception as e:
+        print(f"tenant removals error (continuing): {e}", file=sys.stderr)
     try:
         if not dry_run:
             backfill_lease_urls(CONFIG["sent_dir"])

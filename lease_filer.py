@@ -291,6 +291,75 @@ def backfill_lease_urls(sent_dir, max_age_days=3):
     return healed
 
 
+# Approvals rail (shared with maintenance/lease-filing cards). Our decision
+# id prefix is `aptpay-` — unclaimed by any other consumer; lease_watcher owns
+# `lease-` and the filing cards own `leasefile-`, so never reuse those.
+_APPROVALS = Path(_SHARED_ROOT) / "approvals"
+APT_LEASE_QUEUE = Path(_SHARED_ROOT) / "apartments_lease_queue"
+
+_ACTION_WORDS = {
+    "cancel_old_payments": "cancel {old}'s future payments",
+    "end_old_residency": "end {old}'s residency",
+    "setup_new_payments": "set {new} up to pay online",
+    "update_payment_amount": "update {new}'s payment amount to ${rent}",
+}
+
+
+def queue_turnover_card(job, job_path=None):
+    """After a lease files + the sheet row updates, put an Apartments.com
+    payments card on the approvals rail. NOTHING touches Apartments.com from
+    this path — an approved card only queues a job for the payments agent."""
+    from lease_turnover import classify_turnover
+    plan = classify_turnover(job)
+    if not plan:
+        return None
+    where = f"{plan['property']}" + (f" / {plan['unit']}" if plan["unit"] else "")
+    if plan["kind"] == "renewal_no_change":
+        push("Renewal — no payment changes",
+             f"{where}: {plan['new_tenant']} re-signed at the same rent "
+             f"(${plan['rent']}). Apartments.com left untouched.",
+             {"job": job.get("property_key", "")})
+        return None
+
+    wants = [_ACTION_WORDS[a].format(old=plan.get("old_tenant") or "the old tenant",
+                                     new=plan["new_tenant"], rent=plan["rent"])
+             for a in plan["actions"]]
+    kind_line = {"turnover": f"NEW tenant (was {plan.get('old_tenant')})",
+                 "move_in": "move-in to a vacant unit",
+                 "renewal_rent_change":
+                     f"renewal, rent ${plan.get('old_rent')} -> ${plan['rent']}"}[plan["kind"]]
+    cid = "aptpay-" + re.sub(r"[^a-z0-9]+", "-",
+                             f"{plan['property']} {plan['unit']}".lower()).strip("-") \
+          + f"-{int(time.time())}"
+    card = {
+        "id": cid, "agent": "lease", "kind": "apartments_payments",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "title": f"Apartments.com: {where} — {plan['new_tenant']}",
+        "subject": f"Payments update: {where}",
+        "from": "Lease pipeline",
+        "body": (f"Lease signed at {where} — {kind_line}.\n"
+                 f"Rent ${plan['rent']}, term {plan['lease_start']} to "
+                 f"{plan['lease_end']}.\n\nOn approve I will (on Apartments.com):\n"
+                 + "\n".join(f"  - {w}" for w in wants)
+                 + "\n\nNothing happens until you approve."),
+        "actions": ["approve", "skip"],
+        "fields": plan,
+    }
+    (_APPROVALS / "pending").mkdir(parents=True, exist_ok=True)
+    tmp = _APPROVALS / "pending" / f"{cid}.json.tmp"
+    tmp.write_text(json.dumps(card, indent=2), encoding="utf-8")
+    tmp.replace(_APPROVALS / "pending" / f"{cid}.json")
+    if job_path:
+        try:
+            rec = json.loads(Path(job_path).read_text(encoding="utf-8"))
+            rec["turnover_card"] = {"id": cid, "kind": plan["kind"],
+                                    "at": card["created_at"]}
+            Path(job_path).write_text(json.dumps(rec, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    return cid
+
+
 def update_sheet_tenant(job, job_path=None, lease_url=""):
     """Write the new tenant onto Jay's master sheet via the Premio app's
     edit-tenant function, using the EXACT row strings the wizard captured
@@ -332,6 +401,7 @@ def update_sheet_tenant(job, job_path=None, lease_url=""):
 
     rec_update = {"requested": body, "previous": previous, "response": resp,
                   "at": datetime.now().isoformat(timespec="seconds")}
+    job["sheet_update"] = rec_update   # callers classify turnover off this
     if job_path:
         try:
             rec = json.loads(Path(job_path).read_text(encoding="utf-8"))
@@ -435,6 +505,10 @@ def file_signed_lease(signed_pdf, job, job_path=None):
     # Turnover: write the new tenant onto the master sheet (its own push;
     # failure never un-files the lease).
     update_sheet_tenant(job, job_path=job_path, lease_url=lease_url)
+    try:
+        queue_turnover_card(job, job_path=job_path)
+    except Exception as e:
+        print(f"WARN: turnover card failed ({e}) — lease is filed regardless")
     return dest
 
 
