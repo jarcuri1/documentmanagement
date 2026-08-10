@@ -42,13 +42,36 @@ Read this first, then `C:\Users\realt\.claude\projects\C--AIAgents\memory\MEMORY
   (tenanttracks_agent.py, on-demand via app / screening_queue) — see the
   tenant-screening memory + TENANTTRACKS_UI_MAP.md.
 
-## IMMEDIATE NEXT: nothing queued — steady state
-No open build task in this repo. The pipeline is live; new leases come from
-Jay via the app wizard. When picking this repo up, first check:
-1. `D:\Dropbox\Dropbox\Leases\Failed` for failed jobs (currently only an old
-   101 Colony test artifact from 7/20).
-2. `git status` — commit anything a failure-scan fix left behind.
-3. The LATER list below if Jay wants new features.
+## TENANT TURNOVER -> APARTMENTS.COM (built 8/10, browser half pending)
+Jay's ask: new lease signed -> cancel old tenant's future payments + end
+residency + set new tenant up to pay online on Apartments.com; renewal with
+same tenant -> only act if rent changed; plus an app "Remove tenant" that
+also retires the lease PDF and clears the sheet row.
+
+Built and LIVE:
+- `lease_turnover.py` classifies each filed signing (turnover / move_in /
+  renewal_rent_change / renewal_no_change) off sheet_update.previous.
+- `lease_filer.queue_turnover_card` puts an `aptpay-` card on the approvals
+  rail (custom TurnoverCard in the app). Approve -> job file in
+  `shared\apartments_lease_queue`. NOTHING touches Apartments.com unapproved.
+- `lease_signed_watcher.consume_removals` executes app Remove-Tenant jobs
+  (`shared\tenant_removals`, from supervisor POST /api/tenant/remove):
+  retire lease PDFs to Past Tenants, clear sheet row (edit-tenant `clear`
+  flag, deployed; prior values snapshotted), queue the payment cancel.
+- App (OTA runtime 1.0.10): TurnoverCard in ApprovalsScreen; RemoveTenant
+  danger-zone section at the bottom of the New Lease tab.
+- Supervisor: POST /api/tenant/remove + `apartments_payments` fleet entry
+  (daily 12:30, runs `ApartmentsAgent\apartments_payments_agent.py`).
+- A real card for 168 Lucille (Sheila -> Mattesons) is pending in the app.
+
+## IMMEDIATE NEXT: map the Apartments.com payments UI
+`apartments_payments_agent.py` is a queue-watcher skeleton — approved jobs
+wait (with a daily push) until the browser half exists. Everything needed is
+listed in `ApartmentsAgent\APARTMENTS_UI_MAP.md` "Lease-payment ACTIONS":
+probe `payments.apartments.com/leases/#!/<id>` detail routes with probe.py
+(lease-details, lease-tenants, request-payment, Set Up Payments wizard),
+then implement the four actions with a SEPARATE chrome-profile-payments.
+Also check `D:\Dropbox\Dropbox\Leases\Failed` and `git status` on pickup.
 
 ## OPEN ITEMS (low stakes)
 - 128 Walnut "test bitches" signing (7/21, jarcuri1@gmail.com) was never
