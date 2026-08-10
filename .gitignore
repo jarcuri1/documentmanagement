@@ -1,9 +1,10 @@
 __pycache__/
 *.pyc
 
-# Automation browser profile — contains the live SmartMLS session cookies.
-# NEVER commit this.
+# Automation browser profiles — contain live session cookies (SmartMLS,
+# TenantTracks). NEVER commit these.
 chrome-profile/
+chrome-profile-tenanttracks/
 
 # Reference PDFs generated locally for overlay alignment (regenerable).
 single_family_lease.pdf

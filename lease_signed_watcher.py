@@ -427,4 +427,15 @@ if __name__ == "__main__":
                       file=sys.stderr)
             time.sleep(CONFIG["poll_seconds"])
     else:
-        process_once(dry_run=args.dry_run)
+        try:
+            process_once(dry_run=args.dry_run)
+        except Exception as e:
+            # Transient DNS blips on gmail.googleapis.com were failing the whole
+            # pipeline tick (and paging Jay). One short retry absorbs those;
+            # anything persistent still fails loudly.
+            if "unable to find the server" in str(e).lower() or "getaddrinfo" in str(e).lower():
+                print(f"[transient] {e} — retrying once in 8s", file=sys.stderr)
+                time.sleep(8)
+                process_once(dry_run=args.dry_run)
+            else:
+                raise
