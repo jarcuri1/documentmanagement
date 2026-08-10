@@ -64,13 +64,17 @@ Built and LIVE:
   (daily 12:30, runs `ApartmentsAgent\apartments_payments_agent.py`).
 - A real card for 168 Lucille (Sheila -> Mattesons) is pending in the app.
 
-## IMMEDIATE NEXT: map the Apartments.com payments UI
-`apartments_payments_agent.py` is a queue-watcher skeleton — approved jobs
-wait (with a daily push) until the browser half exists. Everything needed is
-listed in `ApartmentsAgent\APARTMENTS_UI_MAP.md` "Lease-payment ACTIONS":
-probe `payments.apartments.com/leases/#!/<id>` detail routes with probe.py
-(lease-details, lease-tenants, request-payment, Set Up Payments wizard),
-then implement the four actions with a SEPARATE chrome-profile-payments.
+## IMMEDIATE NEXT: implement apartments_payments_agent.py browser half
+The payments/residents UI IS MAPPED (live-probed 8/10 with Jay's OK — see
+`ApartmentsAgent\APARTMENTS_UI_MAP.md` "Payments & Residents" table:
+End Payments confirm chain, Edit Rent form, Residents & Leases list/detail,
+Set Up New Resident entry). Remaining before code: walk the set-up wizard
+past page 1, the Edit Rent review step, and an ACTIVE resident's detail
+view (probed one was ended — showed Re-enable). Then implement the four
+queue actions with a separate chrome-profile-payments. The 8/10 turnover
+card for 168 Lucille was DELETED as stale (Jay removed Sheila by hand, and
+his app pre-OTA showed the wrong card UI — make sure he's on runtime 1.0.10
+before the next card goes out).
 Also check `D:\Dropbox\Dropbox\Leases\Failed` and `git status` on pickup.
 
 ## OPEN ITEMS (low stakes)
