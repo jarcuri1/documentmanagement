@@ -361,9 +361,30 @@ def consume_turnover_decisions():
                 datetime.now().isoformat(timespec="seconds"),
                 "card_id": d["id"]}, indent=2), encoding="utf-8")
             tmp.replace(jf)
+            # Escalation cards carry a sheet_fix: correct the books now
+            # (rentOnly — tenant/phone/deposit untouched), the Apartments
+            # payment change rides the queued job.
+            fixed = ""
+            sf = plan.get("sheet_fix")
+            if sf and sf.get("unit") and sf.get("rent"):
+                try:
+                    import urllib.request
+                    from lease_filer import _PREMIO_APP
+                    body = {"sheetType": "owned" if sf.get("tab") != "premio" else "premio",
+                            "propertyAddress": sf["property"], "unitName": sf["unit"],
+                            "tenantName": "", "rentOnly": True, "rent": sf["rent"]}
+                    req = urllib.request.Request(
+                        f"{_PREMIO_APP}/.netlify/functions/edit-tenant",
+                        data=json.dumps(body).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}, method="POST")
+                    with urllib.request.urlopen(req, timeout=45) as r:
+                        if json.loads(r.read().decode("utf-8")).get("success"):
+                            fixed = f" Sheet set to ${sf['rent']}."
+                except Exception as e:
+                    fixed = f" Sheet fix FAILED ({e}) — update by hand."
             push("Apartments.com job queued",
                  f"{where}: approved — {', '.join(plan['actions'])}. The "
-                 f"payments agent will run it.", {"kind": "lease"})
+                 f"payments agent will run it.{fixed}", {"kind": "lease"})
         else:
             push("Apartments.com update skipped",
                  f"{where}: no changes will be made.", {"kind": "lease"})
