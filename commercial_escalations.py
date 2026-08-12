@@ -47,6 +47,7 @@ def card_escalation(lease, sheet_rent, due_rent, state):
         return None   # already carded this amount; Jay skipped or it's pending
     plan = {
         "kind": "escalation",
+        "lease_key": lease["key"],   # lets a 'hold' decision re-arm next month
         "property": lease["sheet"]["property"],
         "unit": lease["sheet"]["unit"],
         "new_tenant": lease["tenant"].split("(")[0].strip(),

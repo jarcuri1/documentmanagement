@@ -385,6 +385,19 @@ def consume_turnover_decisions():
             push("Apartments.com job queued",
                  f"{where}: approved — {', '.join(plan['actions'])}. The "
                  f"payments agent will run it.{fixed}", {"kind": "lease"})
+        elif d.get("action") == "hold" and plan.get("lease_key"):
+            # Snooze one month: clear the escalation dedupe entry so the
+            # 1st-of-month checker re-cards the same increase next run.
+            state_f = Path(_SHARED_ROOT) / "commercial_escalations_state.json"
+            try:
+                st = json.loads(state_f.read_text(encoding="utf-8"))
+                st.pop(plan["lease_key"], None)
+                state_f.write_text(json.dumps(st, indent=2), encoding="utf-8")
+            except Exception as e:
+                print(f"hold re-arm failed: {e}", file=sys.stderr)
+            push("Rent increase held",
+                 f"{where}: held for now — I'll ask again on the 1st of "
+                 f"next month.", {"kind": "lease"})
         else:
             push("Apartments.com update skipped",
                  f"{where}: no changes will be made.", {"kind": "lease"})
