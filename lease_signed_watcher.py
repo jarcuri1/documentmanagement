@@ -228,6 +228,26 @@ _DECISIONS_DIR = Path(_SHARED_ROOT) / "approvals" / "decisions"
 _DONE_DIR = Path(_SHARED_ROOT) / "approvals" / "done"
 # Tenant-removal jobs the app queues via the supervisor (POST /api/tenant/remove)
 _REMOVALS_DIR = Path(_SHARED_ROOT) / "tenant_removals"
+# Non-lease signings (purchase contracts) land here instead of the lease flow.
+_CONTRACTS_DIR = Path(os.environ.get("LEASE_CONTRACTS_DIR",
+                                     r"D:\Dropbox\Dropbox\Signed Contracts"))
+
+
+def _classify_signing(signing_name, filename, pdf_text):
+    """'purchase' | 'supplement' | 'lease' for a completed signing that
+    matched no sent job. Conservative: anything unclear stays 'lease' and
+    goes to the filing card for Jay to decide."""
+    t = (pdf_text or "").lower()
+    label = f"{signing_name} {filename}".lower()
+    lease_hits = t.count("lease") + t.count("landlord") + t.count("tenant")
+    if (("purchase contract" in t or "purchase and sale" in t
+         or (t.count("buyer") >= 5 and t.count("seller") >= 3))
+            and lease_hits <= 2):
+        return "purchase"
+    if any(k in label for k in ("amendment", "amndmnt", "addendum")) \
+            or "amendment" in t[:600] or "addendum" in t[:600]:
+        return "supplement"
+    return "lease"
 
 
 def _folder_choices():
@@ -588,6 +608,52 @@ def _process_account(service, acct, msgs, processed, dry_run, file_signed_lease)
         job, jf = correlate_job(name, CONFIG["sent_dir"], pdf_text=_pdf_text(tmp))
         if not job:
             pdf_text = _pdf_text(tmp)
+            # Not every SmartMLS signing is a lease (Jay 8/14: 200 Yale was a
+            # purchase contract; "anna final" was extra Section-8 paperwork
+            # that must NOT displace the current lease).
+            kind = _classify_signing(name, lease_att["filename"], pdf_text)
+            if kind == "purchase":
+                _CONTRACTS_DIR.mkdir(parents=True, exist_ok=True)
+                dest = _CONTRACTS_DIR / lease_att["filename"]
+                if dest.exists():
+                    dest = dest.with_name(f"{dest.stem}-{int(time.time())}{dest.suffix}")
+                tmp.replace(dest)
+                push("Signed contract filed (not a lease)",
+                     f"'{name}' is a purchase contract — saved to Signed "
+                     f"Contracts as {dest.name}.", {"name": name})
+                processed.add(key)
+                handled += 1
+                continue
+            if kind == "supplement":
+                choices = _folder_choices()
+                g = _guess_property(choices, name, pdf_text)
+                folder = None
+                if g:
+                    try:
+                        mapping = json.loads(_FOLDERS_JSON.read_text(encoding="utf-8"))
+                        folder = (mapping.get(g["property_key"]) or {}).get("folder")
+                    except Exception:
+                        folder = None
+                if folder and os.path.isdir(folder):
+                    dest = Path(folder) / lease_att["filename"]
+                    if dest.exists():
+                        dest = dest.with_name(f"{dest.stem}-{int(time.time())}{dest.suffix}")
+                    tmp.replace(dest)
+                    push("Signed addendum filed",
+                         f"'{name}' looks like an amendment/addendum — saved "
+                         f"WITH the property's documents at {Path(folder).name} "
+                         f"(current lease untouched).", {"name": name})
+                    processed.add(key)
+                    handled += 1
+                    continue
+                # no property match — fall through to the filing card
+            # Dedupe: Sign emails the same completion to every watched inbox;
+            # one pending card per signing is plenty.
+            slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40]
+            if list(_CARDS_DIR.glob(f"leasefile-{slug}-*.json")):
+                tmp.unlink(missing_ok=True)
+                processed.add(key)
+                continue
             CONFIG["unfiled_dir"].mkdir(parents=True, exist_ok=True)
             dest = CONFIG["unfiled_dir"] / lease_att["filename"]
             if dest.exists():
