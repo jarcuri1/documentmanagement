@@ -376,10 +376,26 @@ class LeaseWatcher:
             except FileNotFoundError:
                 continue
             if age >= cutoff and job_json.name not in self._stale_warned:
-                if not self.dry_run:
+                # Persist the warning marker — the watcher runs --once per
+                # pipeline tick, so an in-memory set alone re-pushed this
+                # EVERY MINUTE (Jay got 10+ alerts on 8/18). One push per
+                # job per 6h is plenty.
+                marker_file = Path(__file__).parent / "state" / "stale_warned.json"
+                warned = {}
+                try:
+                    warned = json.loads(marker_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+                last = warned.get(job_json.name, 0)
+                if not self.dry_run and (now - last) > 6 * 3600:
                     push("Lease stuck", f"{job_json.stem} has sat in Sending for "
-                         f"{int(age // 60)}m — a send likely died mid-run. Not retried; "
-                         f"check Audit + Authentisign.", {"job": job_json.stem})
+                         f"{int(age // 60)}m — the send likely died mid-run. Not "
+                         f"retried; check the Audit folder screenshots to see how "
+                         f"far it got on SmartMLS Sign.", {"job": job_json.stem})
+                    warned[job_json.name] = now
+                    warned = {k: v for k, v in warned.items() if now - v < 48 * 3600}
+                    marker_file.parent.mkdir(parents=True, exist_ok=True)
+                    marker_file.write_text(json.dumps(warned), encoding="utf-8")
                 self._stale_warned.add(job_json.name)
         self._stale_warned &= present
 

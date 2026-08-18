@@ -423,10 +423,14 @@ def update_sheet_tenant(job, job_path=None, lease_url=""):
     return ok
 
 
-def file_signed_lease(signed_pdf, job, job_path=None):
+def file_signed_lease(signed_pdf, job, job_path=None, retire=True):
     """File one signed lease. Returns the destination Path, or the _unfiled Path
     if it couldn't be filed. Never raises for a routing miss — it fails loud via
-    _unfiled + push, per the spec."""
+    _unfiled + push, per the spec.
+
+    retire=False: place the PDF without retiring same-prefix leases — for
+    card-filed documents (the 'water 168 lucille' card evicted the Mattesons'
+    real lease to Past Tenants on 8/18; only pipeline-sent leases may retire)."""
     signed_pdf = Path(signed_pdf)
     if not signed_pdf.exists():
         raise LeaseFileError(f"signed PDF not found: {signed_pdf}")
@@ -464,7 +468,7 @@ def file_signed_lease(signed_pdf, job, job_path=None):
     retired, retired_names = 0, []
     try:
         existing = [f for f in os.listdir(dest_folder)
-                    if f.startswith(prefix) and f.lower().endswith(".pdf") and f != fname]
+                    if retire and f.startswith(prefix) and f.lower().endswith(".pdf") and f != fname]
     except OSError:
         existing = []
     if existing:

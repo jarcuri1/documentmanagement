@@ -322,9 +322,15 @@ def consume_filing_decisions():
             print(f"bad filing decision {f.name}: {e}", file=sys.stderr)
             f.rename(f.with_suffix(".json.bad"))
             continue
-        pdf = CONFIG["unfiled_dir"] / (info.get("pdf") or "")
+        # Guard: a skip decision with no pdf name once resolved to the
+        # _unfiled DIRECTORY itself and the rename below crashed the whole
+        # consumer every tick (Aug 11-18 backlog). No pdf = nothing to move.
+        pdf_name = (info.get("pdf") or "").strip()
+        pdf = (CONFIG["unfiled_dir"] / pdf_name) if pdf_name else None
+        if pdf is not None and pdf.is_dir():
+            pdf = None
         action = d.get("action")
-        if action == "file" and info.get("property_key") and pdf.exists():
+        if action == "file" and info.get("property_key") and pdf and pdf.exists():
             job = {
                 "property_key": info["property_key"],
                 "unit": info.get("unit", ""),
@@ -332,14 +338,15 @@ def consume_filing_decisions():
                 "tenant_name": info.get("signing_name") or "Manual",
                 "term_start_iso": datetime.now().strftime("%Y-%m-%d"),
             }
-            file_signed_lease(pdf, job)   # pushes its own "Lease filed"
+            # retire=False: card-filed docs must never evict the current lease
+            file_signed_lease(pdf, job, retire=False)   # pushes its own "Lease filed"
         elif action == "file":
             push("Filing failed",
                  f"Couldn't file '{info.get('pdf')}' — file missing or no "
                  f"property picked. It's still in _unfiled.", {})
         else:   # skip / Don't file
             skipped = CONFIG["unfiled_dir"] / "skipped"
-            if pdf.exists():
+            if pdf and pdf.exists():
                 skipped.mkdir(parents=True, exist_ok=True)
                 target = skipped / pdf.name
                 if target.exists():
