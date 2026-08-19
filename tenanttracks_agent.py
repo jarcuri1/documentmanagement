@@ -282,13 +282,16 @@ def _derive_property_details(typed):
     norm = lambda s: re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
     street = typed.split(",")[0].strip()
     details = {"name": street, "address": street, "city": "", "zip": "",
-               "deposit": "1000", "rent": "1000"}
+               "state": "CT", "deposit": "1000", "rent": "1000"}
     if "," in typed:
         rest = typed.split(",", 1)[1]
         m = re.search(r"(\d{5})", rest)
         if m:
             details["zip"] = m.group(1)
-        details["city"] = re.sub(r"\bCT\b|\d{5}", "", rest, flags=re.I).strip(" ,")
+        sm = re.search(r"\b(CT|NH|MA|NY|RI)\b", rest, re.I)
+        if sm:
+            details["state"] = sm.group(1).upper()
+        details["city"] = re.sub(r"\b(CT|NH|MA|NY|RI)\b|\d{5}", "", rest, flags=re.I).strip(" ,")
     try:
         base = os.environ.get("SUPERVISOR_URL", "http://100.66.99.5:8787")
         with urllib.request.urlopen(f"{base}/api/lease/options", timeout=30) as r:
@@ -318,16 +321,48 @@ def _derive_property_details(typed):
                 details["rent"] = digits(units[0]["rent"])
             if digits(units[0].get("deposit")):
                 details["deposit"] = digits(units[0]["deposit"])
+        sm = re.search(r"\b(CT|NH|MA|NY|RI)\b", sa, re.I)
+        if sm:
+            details["state"] = sm.group(1).upper()
+    # Sheet cells like '2026 N Main St Pittsburg, NH' embed the town in the
+    # street part — split at the street-type suffix (the NH property failed
+    # here 8/19: city came out 'NH', state stayed Connecticut, TT refused
+    # the save and the run timed out). Runs LAST so the sheet match above
+    # can't clobber the cleaned address.
+    if not details["city"] or details["city"].upper() == details["state"]:
+        ssm = re.match(r"(.*?\b(?:St|Rd|Ave|Ln|Dr|Tpke|Turnpike|Street|Road|Avenue|Lane|Drive)\.?)\s+(.+)$",
+                       details["address"], re.I)
+        if ssm:
+            details["address"] = details["name"] = ssm.group(1).strip()
+            details["city"] = ssm.group(2).strip()
+    # Zips the sheet doesn't carry (out-of-state properties):
+    _ZIP_HINTS = {"pittsburg nh": "03592"}
+    if not details["zip"]:
+        details["zip"] = _ZIP_HINTS.get(f"{details['city']} {details['state']}".lower().strip(), "")
     return details if details["city"] else None
 
 
+_STATE_NAMES = {"CT": "Connecticut", "NH": "New Hampshire", "MA": "Massachusetts",
+                "NY": "New York", "RI": "Rhode Island"}
+
+
 def _create_property(page, details):
-    """Fill and save TT's Add New Property form (state stays Connecticut;
-    marketplace visibility and the $49.99 MA-records add-on stay 'No')."""
+    """Fill and save TT's Add New Property form (marketplace visibility and
+    the $49.99 MA-records add-on stay 'No'). State: the dropdown defaults
+    to Connecticut — select the property's real state (NH property 8/19)."""
     t = CONFIG["step_timeout_ms"]
     page.fill("input[placeholder='Property Name']", details["name"])
     page.fill("input[placeholder='Property Address']", details["address"])
     page.fill("input[placeholder='Property City']", details["city"])
+    state = details.get("state") or "CT"
+    if state != "CT":
+        # the add-new form's state dropdown sits next to the Postal Code box
+        # (NOT the page's first select — that's Choose Existing Property)
+        sel = page.locator("select:near(input[placeholder='Postal Code'])").first
+        try:
+            sel.select_option(label=_STATE_NAMES.get(state, state))
+        except Exception:
+            sel.select_option(value=state)
     if details["zip"]:
         page.fill("input[placeholder='Postal Code']", details["zip"])
     page.fill("input[placeholder='Security Deposit']", details["deposit"])
