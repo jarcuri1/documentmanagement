@@ -179,6 +179,95 @@ def scrape_applications(page):
     }""")
 
 
+# ----------------------------------------------------------------------
+# Report synopsis — when a screening completes, read the TransUnion report
+# and condense it into Jay's rubric via Claude. Reports EXPIRE fast on
+# TenantTracks, so this runs the moment an applicant flips to 'screened'.
+# ----------------------------------------------------------------------
+def _anthropic_key():
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key:
+        return key
+    try:  # standalone runs outside the fleet env: parse shared\.env
+        for line in (_SHARED / ".env").read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("ANTHROPIC_API_KEY="):
+                return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+_SYNOPSIS_PROMPT = """You are summarizing a tenant-screening report (TransUnion \
+credit + criminal + eviction) for a landlord. Produce a PLAIN TEXT synopsis, \
+max ~20 short lines, facts only — no advice, no recommendation, no commentary. \
+The landlord makes his own decision.
+
+Format, in this order:
+1. If there is an auto/car repossession anywhere: FIRST line must be
+   "SEVERE FLAG: CAR REPOSSESSION" plus the details on the next line.
+2. "Score: <credit score>" (or "Score: not shown").
+3. "Collections: <N> accounts" then one line each:
+   "- <creditor>: $<amount> (<medical | student loan | other>)".
+4. Missed-payment picture on NON-collection accounts, as a pattern statement,
+   e.g. "No missed payments outside the collections in the past 24 months"
+   or "5 missed payments on other accounts in the past 2 years (latest: <date>)".
+   List medical and student-loan missed payments SEPARATELY and label them
+   "(medical — typically disregarded)" / "(student loan — typically disregarded)"
+   — the landlord does not count those against applicants.
+5. "Criminal: <records with charge + year, or 'none reported'>".
+6. "Evictions: <records with year + outcome, or 'none reported'>".
+
+If the report text is garbled or missing a section, say "<section>: could not \
+read" rather than guessing. Never invent numbers."""
+
+
+def synopsize_report(report_text, applicant_label):
+    """One Claude call -> plain-text synopsis, or None on any failure.
+    Uses claude-opus-5 per the fleet's approved tier for tenant-facing work
+    (accuracy-sensitive, ~pennies per report at this volume)."""
+    key = _anthropic_key()
+    if not key:
+        print("WARN: no ANTHROPIC_API_KEY — skipping report synopsis", file=sys.stderr)
+        return None
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=key)
+        resp = client.messages.create(
+            model="claude-opus-5",
+            max_tokens=2000,
+            system=_SYNOPSIS_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": f"Applicant: {applicant_label}\n\nReport text:\n{report_text[:150000]}",
+            }],
+        )
+        if resp.stop_reason == "refusal":
+            print("WARN: synopsis refused", file=sys.stderr)
+            return None
+        return next((b.text for b in resp.content if b.type == "text"), None)
+    except Exception as e:
+        print(f"WARN: synopsis failed ({e})", file=sys.stderr)
+        return None
+
+
+def fetch_report_text(page, app_id):
+    """Open a completed application's report page; None when expired/unreadable."""
+    goto_app_page(
+        page,
+        f"{CONFIG['app_url']}/report_smart?page=applicationSa&application_id={app_id}",
+        "body")
+    page.wait_for_timeout(4000)
+    text = page.evaluate("() => document.body.innerText")
+    if "expired and no longer available" in text or "Errors getting application" in text:
+        return None
+    if len(text) < 2000:  # report content plainly didn't load
+        hidden = page.evaluate("() => document.body.textContent")
+        if len(hidden) > len(text) * 2:
+            return hidden
+        return None
+    return text
+
+
 def _auto_alias(tt_property, aliases, folder_keys):
     """Map a TenantTracks property name to a lease_folders key when the
     slugified name prefixes exactly one key (e.g. '128 Walnut St' ->
@@ -250,7 +339,7 @@ def pull(page, dry_run=False):
         })
         if status == "screened" and was != "screened":
             cur["screened_at"] = datetime.now().isoformat(timespec="seconds")
-            newly_screened.append(cur)
+            newly_screened.append((r["app_id"], cur))
     if dry_run:
         return 0
     try:
@@ -262,11 +351,27 @@ def pull(page, dry_run=False):
     except Exception as e:
         print(f"property scrape failed (registry keeps old list): {e}", file=sys.stderr)
     save_registry(reg)
-    for a in newly_screened:
-        push("Screening complete",
-             f"{a.get('name') or a['email']} — {a['tt_property']} ({a['city']}). "
-             f"Report is ready on TenantTracks.",
-             {"app_id": next(k for k, v in reg['applicants'].items() if v is a)})
+    # Reports expire quickly — synopsize each fresh completion NOW, while the
+    # browser is open and the report is still live.
+    for app_id, a in newly_screened:
+        label = f"{a.get('name') or a['email']} — {a['tt_property']} ({a['city']})"
+        synopsis = None
+        try:
+            text = fetch_report_text(page, app_id)
+            if text:
+                synopsis = synopsize_report(text, label)
+        except Exception as e:
+            print(f"report fetch failed for {app_id}: {e}", file=sys.stderr)
+        if synopsis:
+            a["synopsis"] = synopsis
+            push(f"Screening complete: {a.get('name') or a['email']}",
+                 f"{label}\n\n{synopsis[:3000]}", {"app_id": app_id})
+        else:
+            push("Screening complete",
+                 f"{label}. Report is ready on TenantTracks (no synopsis — "
+                 f"open the site to view).", {"app_id": app_id})
+    if newly_screened:
+        save_registry(reg)
     print(f"pull: {len(rows)} rows, {added} new, {len(newly_screened)} newly screened")
     return len(newly_screened)
 
@@ -375,12 +480,21 @@ def _create_property(page, details):
 
 # ----------------------------------------------------------------------
 def run_screening(page, job):
-    t = CONFIG["step_timeout_ms"]
+    """One FULL pass through the request flow PER APPLICANT. 'Add Additional
+    Applicant' did not render a second input row the way the map assumed
+    (first 2-applicant job, 8/19, timed out) — separate submissions are
+    equivalent: TT invites and charges each applicant individually, and the
+    property exists after pass one so pass two just picks it."""
     applicants = job.get("applicants") or []
     assert applicants and all(a.get("email") for a in applicants), "job needs applicant emails"
     for a in applicants:
         a.setdefault("phone", "2035550100")   # Jay's rule: fake number when unknown
+    for a in applicants:
+        _run_one_screening(page, job, a)
 
+
+def _run_one_screening(page, job, applicant):
+    t = CONFIG["step_timeout_ms"]
     goto_app_page(page, f"{CONFIG['app_url']}/report_smart?page=new",
                   'text="Applicant Pays"')
     # 1. payer — ALWAYS applicant pays. EXACT text matches only: the intro
@@ -415,17 +529,11 @@ def run_screening(page, job):
             "out its address/town/zip from the sheet — retype it as "
             "'street, town zip' (e.g. '29 Evans St, Waterbury 06705').")
         _create_property(page, details)
-    # 3. Option 1 form
+    # 3. Option 1 form — single applicant per pass (see run_screening)
     page.click("text=Option 1: Send Background check request", timeout=t)
-    for i, a in enumerate(applicants):
-        if i > 0:
-            page.click("text=Add Additional Applicant", timeout=t)
-        emails = page.locator("input[placeholder='Applicant Email']")
-        retypes = page.locator("input[placeholder='Retype Applicant Email']")
-        phones = page.locator("input[placeholder='Applicant Phone']")
-        emails.nth(i).fill(a["email"])
-        retypes.nth(i).fill(a["email"])
-        phones.nth(i).fill(a["phone"])
+    page.locator("input[placeholder='Applicant Email']").first.fill(applicant["email"])
+    page.locator("input[placeholder='Retype Applicant Email']").first.fill(applicant["email"])
+    page.locator("input[placeholder='Applicant Phone']").first.fill(applicant["phone"])
     # The whole flow is ONE page (anchored sections), so the MA criminal
     # add-on checkbox from step 1 is also in the DOM — scope to the checkbox
     # next to the "I confirm I have read" text, NEVER the first on the page.
