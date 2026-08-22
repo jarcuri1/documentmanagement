@@ -285,6 +285,8 @@ class LeaseWatcher:
             return None
         try:
             shutil.move(str(job_json), str(dest))
+            os.utime(dest, None)   # fresh mtime: moves keep the old one, which
+                                   # made re-claimed jobs look stale instantly
             return dest
         except Exception as e:
             push("Lease error", f"claim failed for {job_json.name}: {e}",
@@ -309,17 +311,21 @@ class LeaseWatcher:
         except subprocess.TimeoutExpired:
             subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
                            capture_output=True)
-            push("Lease stuck", f"{sending_path.stem}: sender hit the "
-                 f"{cap_s // 60}-minute cap and was killed. Job left in Sending. "
-                 f"Check Audit + Authentisign before re-queuing — do NOT assume "
-                 f"nothing was sent.", {"job": sending_path.stem})
+            # No push here — reconcile() either auto-retries (audit shows the
+            # send step was never reached) or pushes the human-review message.
+            log(f"{sending_path.stem}: sender hit the {cap_s // 60}-minute cap "
+                f"and was killed.")
             return 124
 
     def reconcile(self, slug, claimed, rc):
         """lease_sender owns all post-launch placement; the watcher never moves
-        the job here. We only push anything a human must look at. (A clean send
-        or a clean pre-send abort already pushed from lease_sender.)"""
+        the job here. A hung/crashed run that PROVABLY never reached the final
+        'send signing' step (audit trail check) auto-retries once; everything
+        else pushes for a human. (A clean send or a clean pre-send abort
+        already pushed from lease_sender.)"""
         still = claimed.exists()
+        if rc != 0 and still and self.maybe_auto_retry(slug, claimed):
+            return
         if rc == 0 and still:
             push("Lease needs review", f"{slug}: sender exited 0 but the job is "
                  f"still in Sending — inconsistent, check it.", {"job": slug})
@@ -327,6 +333,57 @@ class LeaseWatcher:
             push("Lease needs review", f"{slug}: sender exited {rc} with the job left "
                  f"in Sending — a send may have gone out. Verify in Authentisign "
                  f"before any resend; do NOT blindly retry.", {"job": slug})
+
+    def _send_already_left(self, slug):
+        """True when this job's newest audit run reached 'send signing' — a
+        retry could then email the tenants twice. Unreadable audit -> True
+        (be safe, don't retry)."""
+        audit_root = CONFIG["pending_dir"].parent / "Audit"
+        try:
+            runs = sorted((d for d in audit_root.iterdir()
+                           if d.is_dir() and d.name.startswith(slug + "-")),
+                          key=lambda d: d.name, reverse=True)
+        except OSError:
+            return True
+        if not runs:
+            return False
+        try:
+            return any("send_signing" in f.name.lower() for f in runs[0].iterdir())
+        except OSError:
+            return True
+
+    def maybe_auto_retry(self, slug, claimed):
+        """One automatic retry for a hung/killed run that never sent anything:
+        move the job back to Pending, re-drop the send decision, push a note.
+        Second failure falls through to the human-review pushes."""
+        try:
+            job = json.loads(claimed.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        if int(job.get("auto_retries", 0)) >= 1:
+            return False
+        if self._send_already_left(slug):
+            return False
+        job["auto_retries"] = int(job.get("auto_retries", 0)) + 1
+        pending = CONFIG["pending_dir"] / claimed.name
+        try:
+            pending.write_text(json.dumps(job, indent=2), encoding="utf-8")
+            claimed.unlink()
+            d = {"id": f"{LEASE_PREFIX}{slug}", "action": "send",
+                 "text": "auto-retry: sender hung before the send step",
+                 "decided_at": datetime.utcnow().isoformat(timespec="milliseconds") + "Z"}
+            CONFIG["decisions_dir"].mkdir(parents=True, exist_ok=True)
+            tmp = CONFIG["decisions_dir"] / f"{LEASE_PREFIX}{slug}.json.tmp"
+            tmp.write_text(json.dumps(d, indent=2), encoding="utf-8")
+            tmp.replace(CONFIG["decisions_dir"] / f"{LEASE_PREFIX}{slug}.json")
+        except Exception as e:
+            push("Lease needs review", f"{slug}: auto-retry setup failed ({e}) — "
+                 f"job left wherever it is; check by hand.", {"job": slug})
+            return True   # don't double-push the generic review message
+        push("Lease auto-retry", f"{slug}: the sender hung before anything was "
+             f"sent, so I'm retrying automatically (once).", {"job": slug})
+        log(f"auto-retry queued for {slug}")
+        return True
 
     # ---- reject ------------------------------------------------------
     def handle_reject(self, path, slug):
