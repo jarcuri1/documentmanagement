@@ -388,6 +388,25 @@ def update_sheet_tenant(job, job_path=None, lease_url=""):
         previous = _read_sheet_row(body["sheetType"], sheet["property"], sheet["unit"])
     except Exception as e:
         previous = {"unreadable": str(e)}
+    # Premio rows split the rent: F = Section 8 / HAP portion, G = what the
+    # tenant pays. The lease carries the TOTAL, so when the row already has a
+    # Section 8 amount, write total - S8 into G and leave F alone (Jay,
+    # 2026-08-23: Anna's $1,400 renewal overwrote her $308 share while the
+    # $1,092 HAP stayed -> sheet said $2,492).
+    split_note = ""
+    if body["sheetType"] == "premio" and isinstance(previous, dict):
+        s8 = _money(previous.get("col_F"))
+        total = _money(body.get("rent"))
+        if s8 and total and total > s8:
+            body["rent"] = total - s8
+            body["rentSection8"] = s8
+            split_note = f" (total {total} = Section 8 {s8} + tenant {body['rent']})"
+        elif s8 and total and total <= s8:
+            push("Sheet rent needs a look",
+                 f"{sheet['property']} / {sheet['unit']}: lease total {total} is not "
+                 f"more than the Section 8 amount {s8} on the sheet. Left the rent "
+                 f"columns unchanged — fix by hand.", {"job": job.get("property_key", "")})
+            body.pop("rent", None)
     try:
         req = urllib.request.Request(
             f"{_PREMIO_APP}/.netlify/functions/edit-tenant",
@@ -413,7 +432,7 @@ def update_sheet_tenant(job, job_path=None, lease_url=""):
     if ok:
         push("Sheet updated",
              f"{sheet['property']} / {sheet['unit']}: tenant -> {tenant_names}, "
-             f"rent {body['rent']}, deposit {body['deposit']}.",
+             f"rent {body.get('rent', 'unchanged')}{split_note}, deposit {body['deposit']}.",
              {"job": job.get("property_key", "")})
     else:
         push("Sheet update FAILED",
