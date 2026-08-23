@@ -88,7 +88,7 @@ Also check `D:\Dropbox\Dropbox\Leases\Failed` and `git status` on pickup.
 
 ## LATER / NICE-TO-HAVE
 - Move old tenant's lease inside the Premio app UI (folder move covers it).
-- Section-8 rent semantics for managed units (col F tenant vs col G total).
+- Section-8 rent semantics, BOTH tabs since 2026-08-23: col F = Section 8 portion, col G = tenant portion; lease total = F+G.
 - Advise Jay again: mortgage credentials live in the link-shared sheet.
 
 ## GOTCHAS (cost hours — do not relearn)
