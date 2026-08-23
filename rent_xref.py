@@ -70,8 +70,8 @@ CARD_ID = CARD_PREFIX + "RENTXREF"
 SHEET_ID = os.environ.get("LEASE_SHEET_ID", "13gBHnNLf8PVD1j7locnJZdDTBndMadWCpLW4GbDnK50")
 # col indexes are 0-based; header row is skipped
 TABS = {
-    # "Combined Empire" (owned): Property,Unit,Tenant,Number,Deposit,Rent,...
-    "Combined Empire": {"rent": [5], "label": "owned"},
+    # "Combined Empire" (owned): ...,Deposit,Rent Section 8,Rent Tenant,... (split since 2026-08-23)
+    "Combined Empire": {"rent": [6, 5], "label": "owned"},
     # "Premio Property Management": ...,Deposit,Rent Section 8,Rent Tenant,...
     "Premio Property Management": {"rent": [6, 5], "label": "managed"},
 }
