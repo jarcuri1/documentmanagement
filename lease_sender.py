@@ -407,6 +407,11 @@ def step(auditor: Auditor, label: str, fn):
             result = fn()
             auditor.snap(f"ok {label}")
             return result
+        except StepFailure:
+            # Deliberate abort inside a step: no retry, but DO leave the
+            # evidence — without this the audit folder showed only ok shots.
+            auditor.snap(f"FAIL {label}")
+            raise
         except (PWTimeout, AssertionError) as e:
             if attempt < MAX_RETRIES:
                 time.sleep(2)
@@ -531,9 +536,11 @@ def _doc_listed(page, name, timeout_ms):
     upload modal and lets silent failures through."""
     # Locator wait (driver-enforced timeout) instead of a page.evaluate poll:
     # a mid-upload page wedge used to block the evaluate forever.
+    # A 1ms "is it there right now?" probe can never resolve through the
+    # driver round-trip, so floor the wait at 500ms.
     try:
         page.locator(".group_document", has_text=name).first.wait_for(
-            state="attached", timeout=timeout_ms)
+            state="attached", timeout=max(int(timeout_ms), 500))
         return True
     except PWTimeout:
         return False
@@ -732,6 +739,11 @@ def _add_template_by_name(page, name):
         if _doc_listed(page, name[:25], 1):
             break
         if time.time() > deadline:
+            try:   # leave the panel's DOM in the log so the next miss is diagnosable
+                print("    documents panel:", page.evaluate(
+                    "()=>[...document.querySelectorAll('.group_document')].map(e=>e.innerText.trim())"))
+            except Exception:
+                pass
             raise StepFailure(f"template {name!r}: neither the mapping dialog nor "
                               f"the attached document appeared after Select")
         if not retried and time.time() > deadline - t / 2000.0                 and page.locator("input[placeholder='Search...']").count():
