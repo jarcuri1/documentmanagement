@@ -393,6 +393,19 @@ def update_sheet_tenant(job, job_path=None, lease_url=""):
     # Section 8 amount, write total - S8 into G and leave F alone (Jay,
     # 2026-08-23: Anna's $1,400 renewal overwrote her $308 share while the
     # $1,092 HAP stayed -> sheet said $2,492).
+    # Renewal / same tenant: keep the row's NAME exactly as Jay wrote it (he
+    # tags the housing program, e.g. "Anna Difrisco (WHA)") and never blank
+    # the PHONE — edit-tenant writes C:E as a block, so an omitted phone
+    # erased it (2026-08-23).
+    if isinstance(previous, dict) and not previous.get("unreadable"):
+        prev_name = (previous.get("tenant") or "").strip()
+        base = re.sub(r"\s*\(.*?\)\s*", " ", prev_name).strip().lower()
+        if prev_name and base == tenant_names.strip().lower():
+            body["tenantName"] = prev_name
+        phone = next((s.get("phone") for s in _signers(job) if s.get("phone")), "")
+        body["tenantPhone"] = phone or previous.get("phone") or ""
+        if not _money(job.get("deposit")) and previous.get("deposit"):
+            body["deposit"] = _money(previous.get("deposit")) or 0
     split_note = ""
     if body["sheetType"] == "premio" and isinstance(previous, dict):
         s8 = _money(previous.get("col_F"))
