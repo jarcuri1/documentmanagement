@@ -1,4 +1,4 @@
-"""Monthly lease-stack health check (Jay, 2026-08-23: "a lightweight health
+r"""Monthly lease-stack health check (Jay, 2026-08-23: "a lightweight health
 check once a month to verify no new issues have arisen and if some did, fix
 it"). Exercises the real browser flows WITHOUT sending anything:
 
