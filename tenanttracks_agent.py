@@ -70,7 +70,7 @@ def push(title, body, data=None):
 def fail_shot(page, label):
     """Screenshot on failure so a TenantTracks UI change is diagnosable from
     the audit folder instead of a bare traceback (same idea as the lease
-    sender's Audit\ folders). Never raises."""
+    sender's Audit folders). Never raises."""
     try:
         d = Path(r"D:\Dropbox\Dropbox\Leases\Audit	enanttracks")
         d.mkdir(parents=True, exist_ok=True)
