@@ -97,7 +97,7 @@ def main():
         if due and sheet.get("unit"):
             try:
                 row = _read_sheet_row(sheet["tab"], sheet["property"], sheet["unit"])
-                sheet_rent = money(row.get("col_G") or row.get("col_F"))
+                sheet_rent = row.get("rent_total") or money(row.get("col_G") or row.get("col_F"))
             except Exception as e:
                 warnings.append(f"{lease['key']}: sheet row unreadable ({e})")
                 sheet_rent = None

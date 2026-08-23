@@ -62,8 +62,9 @@ def classify_turnover(job):
     new_tenant = req.get("tenantName", "")
     old_tenant = _DECOR.sub(" ", str(prev.get("tenant") or "")).strip()
     new_rent = _money(req.get("rent"))
-    # Sheet rent lives in col F (tenant portion) — G is the Section-8 total.
-    old_rent = _money(prev.get("col_F"))
+    # Both tabs (since 2026-08-23): F = Section 8 portion, G = tenant portion.
+    # The filer writes the tenant portion into G, so compare against prev G.
+    old_rent = _money(prev.get("col_G"))
 
     base = {
         "property": req["propertyAddress"],
@@ -90,7 +91,7 @@ def classify_turnover(job):
 
 if __name__ == "__main__":
     cases = [
-        # (prev tenant, new tenantName, prev col_F, new rent, expected kind)
+        # (prev tenant, new tenantName, prev col_G, new rent, expected kind)
         ("Sheila", "Matteson Robert & Matteson Heather", "1650", "2500", "turnover"),
         ("Katelyn Goff", "Katelyn Goff", "2500", "2500", "renewal_no_change"),
         ("Katelyn Goff", "Goff Katelyn", "2500", "2600", "renewal_rent_change"),
@@ -103,7 +104,7 @@ if __name__ == "__main__":
         job = {"sheet_update": {
             "requested": {"propertyAddress": "1 Test St", "unitName": "Main",
                           "tenantName": new, "rent": rent},
-            "previous": {"tenant": prev, "col_F": old_rent}}}
+            "previous": {"tenant": prev, "col_G": old_rent}}}
         got = classify_turnover(job)
         kind = got["kind"] if got else None
         status = "ok " if kind == want else "FAIL"

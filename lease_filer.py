@@ -388,7 +388,7 @@ def update_sheet_tenant(job, job_path=None, lease_url=""):
         previous = _read_sheet_row(body["sheetType"], sheet["property"], sheet["unit"])
     except Exception as e:
         previous = {"unreadable": str(e)}
-    # Premio rows split the rent: F = Section 8 / HAP portion, G = what the
+    # Sheet rows split the rent: F = Section 8 / HAP portion, G = what the
     # tenant pays. The lease carries the TOTAL, so when the row already has a
     # Section 8 amount, write total - S8 into G and leave F alone (Jay,
     # 2026-08-23: Anna's $1,400 renewal overwrote her $308 share while the
@@ -407,7 +407,8 @@ def update_sheet_tenant(job, job_path=None, lease_url=""):
         if not _money(job.get("deposit")) and previous.get("deposit"):
             body["deposit"] = _money(previous.get("deposit")) or 0
     split_note = ""
-    if body["sheetType"] == "premio" and isinstance(previous, dict):
+    # (both tabs since 2026-08-23 — Combined Empire got the same F/G split)
+    if isinstance(previous, dict):
         s8 = _money(previous.get("col_F"))
         total = _money(body.get("rent"))
         if s8 and total and total > s8:
