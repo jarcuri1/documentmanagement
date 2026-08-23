@@ -81,8 +81,12 @@ def _read_sheet_row(tab, property_addr, unit_name):
             break   # walked into the next property
         if found and unit == unit_name:
             g = lambda i: row[i].strip() if len(row) > i else ""
+            # Both tabs (since 2026-08-23): F = Section 8 portion, G = tenant portion
+            s8, tenant_rent = _money(g(5)), _money(g(6))
             return {"tenant": g(2), "phone": g(3), "deposit": g(4),
-                    "col_F": g(5), "col_G": g(6)}
+                    "col_F": g(5), "col_G": g(6),
+                    "rent_s8": s8, "rent_tenant": tenant_rent,
+                    "rent_total": ((s8 or 0) + (tenant_rent or 0)) if (s8 or tenant_rent) else None}
     return None
 
 
