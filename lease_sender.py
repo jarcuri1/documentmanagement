@@ -399,6 +399,11 @@ def step(auditor: Auditor, label: str, fn):
     """Run one step with screenshot-on-success and screenshot+abort on failure."""
     for attempt in range(MAX_RETRIES + 1):
         try:
+            # Responsiveness probe: a wedged Sign page makes any page.evaluate
+            # below block with NO timeout (the 25-minute hang). wait_for_function
+            # IS timeout-enforced by the driver, so a frozen page fails this step
+            # in 20s with a real error instead of hanging until the watchdog.
+            auditor.page.wait_for_function("() => document.readyState", timeout=20_000)
             result = fn()
             auditor.snap(f"ok {label}")
             return result
@@ -524,15 +529,14 @@ def _doc_listed(page, name, timeout_ms):
     This is the only trustworthy postcondition that a document actually
     attached — matching the filename anywhere on screen also matches the
     upload modal and lets silent failures through."""
-    deadline = time.time() + timeout_ms / 1000.0
-    while time.time() < deadline:
-        listed = page.evaluate(
-            "(n)=>[...document.querySelectorAll('.group_document')]"
-            ".some(e=>(e.innerText||'').includes(n))", name)
-        if listed:
-            return True
-        page.wait_for_timeout(500)
-    return False
+    # Locator wait (driver-enforced timeout) instead of a page.evaluate poll:
+    # a mid-upload page wedge used to block the evaluate forever.
+    try:
+        page.locator(".group_document", has_text=name).first.wait_for(
+            state="attached", timeout=timeout_ms)
+        return True
+    except PWTimeout:
+        return False
 
 
 def _add_uploaded_document(page, pdf_path):

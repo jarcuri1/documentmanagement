@@ -326,6 +326,12 @@ class LeaseWatcher:
         still = claimed.exists()
         if rc != 0 and still and self.maybe_auto_retry(slug, claimed):
             return
+        # Clean fast failure (sender moved the job to Failed itself): same
+        # audit-gated single retry — a wedged Sign page now fails in seconds
+        # instead of hanging, and deserves one fresh-browser attempt.
+        failed = CONFIG["pending_dir"].parent / "Failed" / claimed.name
+        if rc != 0 and not still and failed.exists() and self.maybe_auto_retry(slug, failed):
+            return
         if rc == 0 and still:
             push("Lease needs review", f"{slug}: sender exited 0 but the job is "
                  f"still in Sending — inconsistent, check it.", {"job": slug})
