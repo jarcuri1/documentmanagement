@@ -1,0 +1,68 @@
+{
+  "lease_type": "single_family",
+  "property": "111 Test St Naugatuck",
+  "signing_name": "HEALTHCHECK - 111 Test St Naugatuck (delete me)",
+  "signers": [
+    {
+      "name": "test one",
+      "email": "jarcuri1@gmail.com"
+    }
+  ],
+  "tenant_name": "test one",
+  "tenant_email": "jarcuri1@gmail.com",
+  "pdf_path": "C:\\AIAgents\\LeaseAgent\\healthcheck\\111-test-st-naugatuck-one.pdf",
+  "documents": [
+    "C:\\AIAgents\\LeaseAgent\\healthcheck\\111-test-st-naugatuck-one.pdf",
+    "C:\\AIAgents\\LeaseAgent\\healthcheck\\111-test-st-naugatuck-one-rental-terms-summary.pdf",
+    "C:\\AIAgents\\LeaseAgent\\healthcheck\\111-test-st-naugatuck-one-disclosure-of-interest.pdf",
+    "C:\\AIAgents\\LeaseAgent\\healthcheck\\111-test-st-naugatuck-one-lead-disclosure-rentals.pdf"
+  ],
+  "property_key": "111-test-st-naugatuck",
+  "unit": "",
+  "filing_address": "111 Test St Naugatuck",
+  "term_start_iso": "2026-08-01",
+  "term_end_iso": "2027-07-31",
+  "rent": "200",
+  "deposit": "5000",
+  "sheet": {
+    "tab": "owned",
+    "property": "111 test st, naugatuck, ct 06770",
+    "unit": "Main"
+  },
+  "landlord_signer": {
+    "name": "Jason Arcuri",
+    "email": "realtorarcuri@gmail.com"
+  },
+  "filed": {
+    "path": "D:\\Dropbox\\Dropbox\\Personal Properties\\111 Test St Naugatuck\\Lease - 111 Test St Naugatuck - one - 2026-08-01.pdf",
+    "filename": "Lease - 111 Test St Naugatuck - one - 2026-08-01.pdf",
+    "retired": [],
+    "at": "2026-07-23T08:01:23",
+    "url": "https://www.dropbox.com/scl/fi/7s359rggdwfv9setdmu81/Lease-111-Test-St-Naugatuck-one-2026-08-01.pdf?rlkey=wvckfo88mhk5zfmejfqd5h843&dl=0"
+  },
+  "sheet_update": {
+    "requested": {
+      "sheetType": "owned",
+      "propertyAddress": "111 test st, naugatuck, ct 06770",
+      "unitName": "Main",
+      "tenantName": "test one",
+      "deposit": 5000,
+      "rent": 200,
+      "leaseStart": "2026-08-01",
+      "leaseEnd": "2027-07-31",
+      "leaseUrl": "https://www.dropbox.com/scl/fi/7s359rggdwfv9setdmu81/Lease-111-Test-St-Naugatuck-one-2026-08-01.pdf?rlkey=wvckfo88mhk5zfmejfqd5h843&dl=0"
+    },
+    "previous": {
+      "tenant": "",
+      "phone": "",
+      "deposit": "",
+      "col_F": "",
+      "col_G": ""
+    },
+    "response": {
+      "success": true,
+      "message": "Tenant updated successfully"
+    },
+    "at": "2026-07-23T08:01:27"
+  }
+}
