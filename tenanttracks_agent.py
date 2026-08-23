@@ -67,6 +67,22 @@ def push(title, body, data=None):
     tmp.replace(CONFIG["push_outbox"] / name)
 
 
+def fail_shot(page, label):
+    """Screenshot on failure so a TenantTracks UI change is diagnosable from
+    the audit folder instead of a bare traceback (same idea as the lease
+    sender's Audit\ folders). Never raises."""
+    try:
+        d = Path(r"D:\Dropbox\Dropbox\Leases\Audit	enanttracks")
+        d.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", label)[:60]
+        f = d / f"{datetime.now():%Y%m%d-%H%M%S}-FAIL_{safe}.png"
+        page.screenshot(path=str(f), full_page=True)
+        print(f"    screenshot: {f}", file=sys.stderr)
+        return str(f)
+    except Exception:
+        return ""
+
+
 def get_credentials():
     import keyring
     svc = CONFIG["keyring_service"]
@@ -587,9 +603,11 @@ def consume_queue(page, dry_run=False):
         except Exception as e:
             import traceback
             traceback.print_exc()
+            shot = fail_shot(page, f"screen_{job.get('tt_property', '')}")
             f.rename(f.with_suffix(".json.failed"))
             push("Screening request FAILED",
-                 f"{who} @ {job.get('tt_property')}: {e}. Job set aside as .failed.",
+                 f"{who} @ {job.get('tt_property')}: {e}. Job set aside as .failed."
+                 f"{' Screenshot: ' + shot if shot else ''}",
                  {"tt_property": job.get("tt_property")})
     # Browser's already open after a send — grab the fresh rows so the new
     # invite shows in the app without Jay tapping refresh.
@@ -622,11 +640,17 @@ def main():
     with sync_playwright() as p:
         ctx, page = open_browser(p)
         try:
+            stage = "login"
             login_if_needed(page)
             if do_pull:
+                stage = "pull"
                 pull(page, dry_run=args.dry_run)
             if do_queue:
+                stage = "queue"
                 consume_queue(page, dry_run=args.dry_run)
+        except Exception:
+            fail_shot(page, stage)
+            raise
         finally:
             ctx.close()
 
