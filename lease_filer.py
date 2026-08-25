@@ -346,7 +346,9 @@ def queue_turnover_card(job, job_path=None):
                  f"{plan['lease_end']}.\n\nOn approve I will (on Apartments.com):\n"
                  + "\n".join(f"  - {w}" for w in wants)
                  + "\n\nNothing happens until you approve."),
-        "actions": ["approve", "skip"],
+        # 'same_tenant' only makes sense when we thought it was a NEW tenant
+        "actions": (["approve", "same_tenant", "skip"]
+                    if plan["kind"] == "turnover" else ["approve", "skip"]),
         "fields": plan,
     }
     (_APPROVALS / "pending").mkdir(parents=True, exist_ok=True)

@@ -83,7 +83,10 @@ def classify_turnover(job):
         # Jay knows it was checked.
         return {**base, "kind": "renewal_no_change", "actions": []}
     if old_tenant:
-        return {**base, "kind": "turnover",
+        # old_rent rides along so a 'same tenant' decision on the card can
+        # tell whether a payment-amount update is needed (Jay, 2026-08-25:
+        # Nick vs Nicolas Melendez — same person, name spelled differently).
+        return {**base, "kind": "turnover", "old_rent": old_rent,
                 "actions": ["cancel_old_payments", "end_old_residency",
                             "setup_new_payments"]}
     return {**base, "kind": "move_in", "actions": ["setup_new_payments"]}

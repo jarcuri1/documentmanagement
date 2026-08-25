@@ -378,6 +378,37 @@ def consume_turnover_decisions():
             continue
         where = plan.get("property", "?") + \
             (f" / {plan['unit']}" if plan.get("unit") else "")
+        # 'Same tenant' (Jay, 2026-08-25): the "new" tenant is the old one
+        # renewing under a differently-spelled name. Never cancel anything —
+        # at most update the payment amount, and only when the rent changed.
+        if d.get("action") == "same_tenant":
+            old_rent, new_rent = plan.get("old_rent"), plan.get("rent")
+            if new_rent and old_rent and new_rent != old_rent:
+                APT_LEASE_QUEUE.mkdir(parents=True, exist_ok=True)
+                job = {**plan, "kind": "renewal_rent_change", "old_rent": old_rent,
+                       "actions": ["update_payment_amount"],
+                       # the payments agent must look up the resident by the
+                       # name Apartments.com already has
+                       "new_tenant": plan.get("old_tenant") or plan.get("new_tenant"),
+                       "approved_at": datetime.now().isoformat(timespec="seconds"),
+                       "card_id": d["id"]}
+                jf = APT_LEASE_QUEUE / f"renewal-{int(time.time()*1000)}.json"
+                tmp = jf.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(job, indent=2), encoding="utf-8")
+                tmp.replace(jf)
+                push("Renewal — payment amount update queued",
+                     f"{where}: same tenant, rent ${old_rent} -> ${new_rent}. "
+                     f"The payments agent will update the amount on "
+                     f"Apartments.com; nothing gets cancelled.", {"kind": "lease"})
+            else:
+                push("Renewal — Apartments.com untouched",
+                     f"{where}: same tenant at the same rent "
+                     f"(${new_rent or old_rent or '?'}). Lease is already "
+                     f"filed and the sheet is updated; no payment changes.",
+                     {"kind": "lease"})
+            f.unlink()
+            handled += 1
+            continue
         # The custom card sends 'approve'; the generic fallback card's
         # buttons send 'send'/'done' — treat all three as yes.
         if d.get("action") in ("approve", "send", "done") and plan.get("actions"):
