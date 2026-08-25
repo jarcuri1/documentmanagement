@@ -188,9 +188,12 @@ def scrape_applications(page):
       return rows.map(r => {
         const c = [...r.querySelectorAll('td')].map(td => strip(td.innerText.trim()));
         if (c.length < 6) return null;
+        const rep = [...r.querySelectorAll('a')]
+          .find(x => x.innerText.trim() === 'Open Report');
         return {tt_property: c[0], city: c[1], app_id: c[2], created: c[3],
                 email: c[4], name: c[5] || null,
-                has_report: r.innerText.includes('Open Report')};
+                has_report: !!rep,
+                report_url: rep ? rep.href : null};
       }).filter(Boolean);
     }""")
 
@@ -266,12 +269,13 @@ def synopsize_report(report_text, applicant_label):
         return None
 
 
-def fetch_report_text(page, app_id):
-    """Open a completed application's report page; None when expired/unreadable."""
-    goto_app_page(
-        page,
-        f"{CONFIG['app_url']}/report_smart?page=applicationSa&application_id={app_id}",
-        "body")
+def fetch_report_text(page, app_id, report_url=None):
+    """Open a completed application's report page; None when expired/unreadable.
+    Use the row's own 'Open Report' href when we have it — the table's visible
+    Application ID is a different number than the id in the report link."""
+    url = report_url or (f"{CONFIG['app_url']}/report_smart"
+                         f"?page=applicationSa&application_id={app_id}")
+    goto_app_page(page, url, "body")
     page.wait_for_timeout(4000)
     text = page.evaluate("() => document.body.innerText")
     if "expired and no longer available" in text or "Errors getting application" in text:
@@ -353,6 +357,8 @@ def pull(page, dry_run=False):
             "status": status,
             "property_key": aliases.get(r["tt_property"], cur.get("property_key")),
         })
+        if r.get("report_url"):
+            cur["report_url"] = r["report_url"]
         if status == "screened" and was != "screened":
             cur["screened_at"] = datetime.now().isoformat(timespec="seconds")
             newly_screened.append((r["app_id"], cur))
@@ -373,7 +379,7 @@ def pull(page, dry_run=False):
         label = f"{a.get('name') or a['email']} — {a['tt_property']} ({a['city']})"
         synopsis = None
         try:
-            text = fetch_report_text(page, app_id)
+            text = fetch_report_text(page, app_id, a.get("report_url"))
             if text:
                 synopsis = synopsize_report(text, label)
         except Exception as e:
