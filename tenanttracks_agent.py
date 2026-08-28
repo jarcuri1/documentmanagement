@@ -269,23 +269,39 @@ def synopsize_report(report_text, applicant_label):
         return None
 
 
+def _report_ready(text):
+    """The report page shows raw code/navigation while TransUnion is still
+    gathering — real content carries report words and real length."""
+    if len(text) < 2000:
+        return False
+    markers = ("Resident Score", "Credit Report", "TransUnion", "Tradeline",
+               "Collections", "Date of Birth")
+    return any(m in text for m in markers)
+
+
 def fetch_report_text(page, app_id, report_url=None):
-    """Open a completed application's report page; None when expired/unreadable.
+    """Open a completed application's report page; None when expired, errored,
+    or still generating after two patient waits (Jay, 2026-08-28: the page
+    shows code while it gathers — wait up to 2 minutes, reload, wait again).
     Use the row's own 'Open Report' href when we have it — the table's visible
     Application ID is a different number than the id in the report link."""
     url = report_url or (f"{CONFIG['app_url']}/report_smart"
                          f"?page=applicationSa&application_id={app_id}")
     goto_app_page(page, url, "body")
-    page.wait_for_timeout(4000)
-    text = page.evaluate("() => document.body.innerText")
-    if "expired and no longer available" in text or "Errors getting application" in text:
-        return None
-    if len(text) < 2000:  # report content plainly didn't load
-        hidden = page.evaluate("() => document.body.textContent")
-        if len(hidden) > len(text) * 2:
-            return hidden
-        return None
-    return text
+    for round_ in range(2):
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            text = page.evaluate("() => document.body.innerText")
+            if ("expired and no longer available" in text
+                    or "Errors getting application" in text):
+                return None
+            if _report_ready(text):
+                return text
+            page.wait_for_timeout(5000)
+        if round_ == 0:
+            page.reload(timeout=CONFIG["step_timeout_ms"])
+            page.wait_for_timeout(3000)
+    return None
 
 
 def _auto_alias(tt_property, aliases, folder_keys):
@@ -389,13 +405,70 @@ def pull(page, dry_run=False):
             push(f"Screening complete: {a.get('name') or a['email']}",
                  f"{label}\n\n{synopsis[:3000]}", {"app_id": app_id})
         else:
-            push("Screening complete",
-                 f"{label}. Report is ready on TenantTracks (no synopsis — "
-                 f"open the site to view).", {"app_id": app_id})
+            _queue_synopsis_retry(app_id, a, attempt=1)
+            push("Screening complete — report still generating",
+                 f"{label}. TenantTracks is still building the report; "
+                 f"I'll check again in 30 minutes and keep retrying.",
+                 {"app_id": app_id})
     if newly_screened:
         save_registry(reg)
     print(f"pull: {len(rows)} rows, {added} new, {len(newly_screened)} newly screened")
     return len(newly_screened)
+
+
+# Retry ladder for reports that were still generating: wait 30 min, then
+# extend the wait each round (Jay, 2026-08-28). ~12h of patience total.
+_RETRY_WAITS_MIN = [30, 60, 90, 120, 180, 240]
+
+
+def _queue_synopsis_retry(app_id, a, attempt):
+    if attempt > len(_RETRY_WAITS_MIN):
+        push("Screening report never loaded",
+             f"{a.get('name') or a.get('email')} — {a.get('tt_property')}: "
+             f"gave up after {len(_RETRY_WAITS_MIN)} retries over ~12h. "
+             f"Open TenantTracks to view the report.", {"app_id": app_id})
+        return
+    wait = _RETRY_WAITS_MIN[attempt - 1]
+    due = datetime.now() + timedelta(minutes=wait)
+    qdir = CONFIG["queue_dir"]
+    qdir.mkdir(parents=True, exist_ok=True)
+    job = {"action": "synopsis_retry", "app_id": app_id, "attempt": attempt,
+           "not_before": due.isoformat(timespec="seconds")}
+    f = qdir / f"synretry-{app_id}-{attempt}.json"
+    tmp = f.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(job), encoding="utf-8")
+    tmp.replace(f)
+    print(f"synopsis retry {attempt} for {app_id} scheduled at {job['not_before']}")
+
+
+def _job_due(job):
+    nb = job.get("not_before")
+    if not nb:
+        return True
+    try:
+        return datetime.now() >= datetime.fromisoformat(nb)
+    except ValueError:
+        return True
+
+
+def run_synopsis_retry(page, job):
+    """Re-open a still-generating report; save + push the synopsis when it
+    finally renders, otherwise re-queue with a longer wait."""
+    app_id = str(job["app_id"])
+    reg = load_registry()
+    a = reg["applicants"].get(app_id)
+    if a is None or a.get("synopsis"):
+        return  # gone, or someone (or a pull) already got it
+    label = f"{a.get('name') or a.get('email')} — {a.get('tt_property')} ({a.get('city')})"
+    text = fetch_report_text(page, app_id, a.get("report_url"))
+    synopsis = synopsize_report(text, label) if text else None
+    if synopsis:
+        a["synopsis"] = synopsis
+        save_registry(reg)
+        push(f"Screening complete: {a.get('name') or a.get('email')}",
+             label + chr(10) * 2 + synopsis[:3000], {"app_id": app_id})
+    else:
+        _queue_synopsis_retry(app_id, a, attempt=int(job.get("attempt", 1)) + 1)
 
 
 # ----------------------------------------------------------------------
@@ -581,6 +654,23 @@ def consume_queue(page, dry_run=False):
             print(f"bad queue file {f.name}: {e}", file=sys.stderr)
             f.rename(f.with_suffix(".json.bad"))
             continue
+        if not _job_due(job):
+            continue
+        # Still-generating reports re-check themselves on a growing timer —
+        # this is Jay's requested follow-up, not background rescanning.
+        if job.get("action") == "synopsis_retry":
+            if dry_run:
+                print(f"[DRY-RUN] would retry synopsis for {job.get('app_id')}")
+                continue
+            try:
+                run_synopsis_retry(page, job)
+            except Exception as e:
+                print(f"synopsis retry error ({job.get('app_id')}): {e}", file=sys.stderr)
+                fail_shot(page, f"synretry_{job.get('app_id')}")
+            finally:
+                f.unlink()
+            handled += 1
+            continue
         # Jay's refresh button queues {"action": "pull"} — on-demand only,
         # never scheduled (his rule: no constant rescanning).
         if job.get("action") == "pull":
@@ -637,10 +727,18 @@ def main():
     if not (do_pull or do_queue):
         ap.error("pick --pull, --queue, or --once")
 
-    # Nothing queued and pull not wanted? Don't even open a browser.
-    if do_queue and not do_pull and not any(CONFIG["queue_dir"].glob("*.json")):
-        print("queue empty — nothing to do")
-        return
+    # Nothing DUE and pull not wanted? Don't even open a browser (retry jobs
+    # carry a not_before — a future one must not spin Chrome every minute).
+    if do_queue and not do_pull:
+        due = []
+        for qf in CONFIG["queue_dir"].glob("*.json"):
+            try:
+                due.append(_job_due(json.loads(qf.read_text(encoding="utf-8"))))
+            except Exception:
+                due.append(True)   # unreadable: let consume_queue triage it
+        if not any(due):
+            print("queue empty — nothing to do")
+            return
 
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
