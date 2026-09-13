@@ -231,14 +231,29 @@ _REMOVALS_DIR = Path(_SHARED_ROOT) / "tenant_removals"
 # Non-lease signings (purchase contracts) land here instead of the lease flow.
 _CONTRACTS_DIR = Path(os.environ.get("LEASE_CONTRACTS_DIR",
                                      r"D:\Dropbox\Dropbox\Signed Contracts"))
+# Listing transaction files (Jay, 2026-08-27): every property being SOLD gets
+# a folder in Listings\ (auto-created from the property address if the photo
+# folder doesn't exist yet); ALL fully-signed docs for that property file into
+# its Signed\ subfolder for the life of the deal. After closing docs arrive,
+# the file stays the target for 3 more months, then is archived — any later
+# contract on the same address starts a NEW file ("<address> (<year>)").
+_LISTINGS_ROOT = Path(os.environ.get("LISTING_DROPBOX_ROOT",
+                                     r"D:\Dropbox\Dropbox\Listings"))
+_LISTING_FILES_STATE = Path(_SHARED_ROOT) / "listing_files.json"
+_LISTING_SIGNED_QUEUE = Path(_SHARED_ROOT) / "listing_signed"   # markers for ListingAgent
+_CLOSING_WORDS = ("closing disclosure", "settlement statement", "deed",
+                  "hud-1", "alta settlement")
+_CLOSED_GRACE_DAYS = 90
 
 
 def _classify_signing(signing_name, filename, pdf_text):
-    """'purchase' | 'supplement' | 'lease' for a completed signing that
-    matched no sent job. Conservative: anything unclear stays 'lease' and
-    goes to the filing card for Jay to decide."""
+    """'listing' | 'purchase' | 'supplement' | 'lease' for a completed signing
+    that matched no sent job. Conservative: anything unclear stays 'lease'
+    and goes to the filing card for Jay to decide."""
     t = (pdf_text or "").lower()
     label = f"{signing_name} {filename}".lower()
+    if "exclusive right to sell" in t or "listing contract" in t[:2000]:
+        return "listing"
     lease_hits = t.count("lease") + t.count("landlord") + t.count("tenant")
     if (("purchase contract" in t or "purchase and sale" in t
          or (t.count("buyer") >= 5 and t.count("seller") >= 3))
@@ -248,6 +263,119 @@ def _classify_signing(signing_name, filename, pdf_text):
             or "amendment" in t[:600] or "addendum" in t[:600]:
         return "supplement"
     return "lease"
+
+
+# ----------------------------------------------------------------------
+# Listing transaction files (property being sold)
+# ----------------------------------------------------------------------
+def _addr_norm(s):
+    s = str(s or "").lower()
+    s = re.sub(r"\b(street|st|road|rd|avenue|ave|drive|dr|lane|ln|court|ct|"
+               r"circle|cir|place|pl|terrace|ter|unit|apt)\b", " ", s)
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+def _listing_state():
+    try:
+        return json.loads(_LISTING_FILES_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_listing_state(st):
+    _LISTING_FILES_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _LISTING_FILES_STATE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(st, indent=2), encoding="utf-8")
+    tmp.replace(_LISTING_FILES_STATE)
+
+
+def find_listing_file(address_text):
+    """Return (folder_path, state_key) for the ACTIVE transaction file matching
+    this address, or (None, best_slug) when none exists / it's archived.
+    Match = fuzzy against Listings\\ folder names (they carry town + seller
+    name with loose spelling) AND against listing_files.json state."""
+    from difflib import SequenceMatcher
+    want = _addr_norm(address_text)
+    want_num = (re.findall(r"\d+", address_text or "") or [""])[0]
+    slug = re.sub(r"[^a-z0-9]+", "-", want).strip("-")[:60] or "unknown"
+    st = _listing_state()
+
+    best, best_score = None, 0.0
+    if _LISTINGS_ROOT.exists():
+        for d in _LISTINGS_ROOT.iterdir():
+            if not d.is_dir():
+                continue
+            have = _addr_norm(d.name)
+            score = SequenceMatcher(None, want, have).ratio()
+            if want_num and want_num in have:
+                score += 0.35
+            if score > best_score:
+                best, best_score = d, score
+    if best is None or best_score < 0.55:
+        return None, slug
+
+    entry = st.get(str(best)) or {}
+    closed = entry.get("closed_at")
+    if closed:
+        try:
+            from datetime import timedelta
+            closed_dt = datetime.fromisoformat(closed)
+            if datetime.now() > closed_dt + timedelta(days=_CLOSED_GRACE_DAYS):
+                return None, slug   # archived — a new contract = a NEW file
+        except Exception:
+            pass
+    return best, slug
+
+
+def file_listing_docs(signing_name, saved_pdfs):
+    """File signed PDFs into the property's transaction file. Creates the
+    folder (plain property address) when none exists; records/updates state;
+    detects closing docs to start the 3-month archive clock; drops a marker
+    for the ListingAgent to upload docs into the MLS draft."""
+    folder, slug = find_listing_file(signing_name)
+    created = False
+    if folder is None:
+        name = re.sub(r'[<>:"/\\|?*]+', "", signing_name).strip() or slug
+        folder = _LISTINGS_ROOT / name
+        # Archived predecessor with the same name -> version the new file.
+        if folder.exists():
+            folder = _LISTINGS_ROOT / f"{name} ({datetime.now().year})"
+        folder.mkdir(parents=True, exist_ok=True)
+        created = True
+    signed = folder / "Signed"
+    signed.mkdir(parents=True, exist_ok=True)
+
+    filed, closing_seen = [], False
+    for p in saved_pdfs:
+        # strip the work-dir's gmail-message-id prefix from the filename
+        clean = re.sub(r"^[0-9a-f]{12,}-", "", p.name)
+        dest = signed / clean
+        if dest.exists():
+            dest = dest.with_name(f"{dest.stem}-{int(time.time())}{dest.suffix}")
+        shutil.move(str(p), str(dest))
+        filed.append(dest.name)
+        if any(w in p.name.lower() for w in _CLOSING_WORDS):
+            closing_seen = True
+
+    st = _listing_state()
+    entry = st.get(str(folder)) or {"opened_at": datetime.now().isoformat(timespec="seconds")}
+    if closing_seen and not entry.get("closed_at"):
+        entry["closed_at"] = datetime.now().isoformat(timespec="seconds")
+    entry["last_filed"] = datetime.now().isoformat(timespec="seconds")
+    st[str(folder)] = entry
+    _save_listing_state(st)
+
+    _LISTING_SIGNED_QUEUE.mkdir(parents=True, exist_ok=True)
+    marker = _LISTING_SIGNED_QUEUE / f"{slug}-{int(time.time())}.json"
+    tmp = marker.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({
+        "signing_name": signing_name, "folder": str(folder),
+        "signed_dir": str(signed), "files": filed, "created_folder": created,
+        "closing_seen": closing_seen,
+        "at": datetime.now().isoformat(timespec="seconds")}, indent=2),
+        encoding="utf-8")
+    tmp.replace(marker)
+    return folder, filed, created, closing_seen
 
 
 def _folder_choices():
@@ -650,6 +778,43 @@ def _process_account(service, acct, msgs, processed, dry_run, file_signed_lease)
             # purchase contract; "anna final" was extra Section-8 paperwork
             # that must NOT displace the current lease).
             kind = _classify_signing(name, lease_att["filename"], pdf_text)
+            # Listing transaction files (Jay 8/27): a listing packet, or ANY
+            # signed doc for a property with an active file in Listings\,
+            # files into that property's Signed\ folder — every attachment
+            # (Sign delivers the docs individually split).
+            active_folder, slug = find_listing_file(name)
+            if kind == "listing" or active_folder is not None:
+                # Dedupe: Sign emails the same completion to every role and
+                # inbox; one filing per signing per day is the real event.
+                recent = [m for m in _LISTING_SIGNED_QUEUE.glob(f"{slug}-*.json")
+                          if time.time() - m.stat().st_mtime < 86_400]
+                if recent:
+                    tmp.unlink(missing_ok=True)
+                    processed.add(key)
+                    continue
+                saved = [tmp]
+                for att in atts:
+                    fn = str(att.get("filename", ""))
+                    if not fn.lower().endswith(".pdf"):
+                        continue
+                    if att.get("attachmentId") == lease_att.get("attachmentId"):
+                        continue
+                    p = CONFIG["work_dir"] / f"{mid}-{re.sub(r'[^A-Za-z0-9._-]+', '_', fn)}"
+                    try:
+                        p.write_bytes(_download_attachment(service, mid, att))
+                        saved.append(p)
+                    except Exception as e:
+                        print(f"listing att download failed {fn}: {e}", file=sys.stderr)
+                folder, filed, created, closing = file_listing_docs(name, saved)
+                push("Signed listing docs filed",
+                     f"'{name}': {len(filed)} signed document(s) filed to "
+                     f"{folder.name}\\Signed{' (new file created)' if created else ''}."
+                     + (" Closing doc detected — 3-month archive clock started."
+                        if closing else ""),
+                     {"name": name, "kind": "listing"})
+                processed.add(key)
+                handled += 1
+                continue
             if kind == "purchase":
                 _CONTRACTS_DIR.mkdir(parents=True, exist_ok=True)
                 dest = _CONTRACTS_DIR / lease_att["filename"]
@@ -734,10 +899,17 @@ if __name__ == "__main__":
         except Exception as e:
             # Transient DNS blips on gmail.googleapis.com were failing the whole
             # pipeline tick (and paging Jay). One short retry absorbs those;
-            # anything persistent still fails loudly.
-            if "unable to find the server" in str(e).lower() or "getaddrinfo" in str(e).lower():
+            # anything persistent still fails loudly. Gmail's per-minute quota
+            # (403 rateLimitExceeded) is the same kind of blip — it clears on
+            # its own, but the quota window is a minute, so wait longer.
+            msg = str(e).lower()
+            if "unable to find the server" in msg or "getaddrinfo" in msg:
                 print(f"[transient] {e} — retrying once in 8s", file=sys.stderr)
                 time.sleep(8)
+                process_once(dry_run=args.dry_run)
+            elif "ratelimitexceeded" in msg or "quota exceeded" in msg:
+                print(f"[transient] gmail quota — retrying once in 35s", file=sys.stderr)
+                time.sleep(35)
                 process_once(dry_run=args.dry_run)
             else:
                 raise
