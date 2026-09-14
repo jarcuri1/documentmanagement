@@ -690,7 +690,9 @@ def consume_removals():
         push("Tenant removed",
              f"{where}: {tenant} — {len(retired)} lease(s) to Past Tenants, "
              f"sheet row {'cleared' if cleared else 'NOT cleared (do by hand)'}, "
-             f"Apartments.com payment cancel queued.", {"kind": "lease"})
+             f"Apartments.com removal is QUEUED — not done yet; you'll get a "
+             f"separate 'Apartments.com done ✓' push when it runs (daily "
+             f"12:30).", {"kind": "lease"})
         handled += 1
     return handled
 
