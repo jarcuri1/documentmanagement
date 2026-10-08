@@ -13,3 +13,7 @@ multi_family_lease.pdf
 # LibreOffice isolated conversion profiles (created next to converted PDFs).
 .lo-*/
 .lo-.*
+
+# Health agent data — medical history, pains, steps. NEVER commit.
+health_agent/data/
+*.db
