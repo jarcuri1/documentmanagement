@@ -3,8 +3,10 @@ Ingest server — the URL your phone posts steps and workouts to
 ==============================================================
 A tiny stdlib HTTP server (no Flask). One endpoint:
 
-  POST /ingest     body = Health Auto Export JSON, or {"date","steps","source"}
+  POST /ingest     body = HC Webhook (Android) JSON, Health Auto Export (iPhone)
+                   JSON, or {"date","steps","source"}
                    auth = header  "Authorization: Bearer <HEALTH_INGEST_TOKEN>"
+                          or header "X-Api-Key: <HEALTH_INGEST_TOKEN>"
                           (or ?token=<...> for apps that can't set headers)
   GET  /ping       liveness check, no auth
 
@@ -51,6 +53,8 @@ def make_handler(store, token):
             auth = self.headers.get("Authorization", "")
             if auth.startswith("Bearer "):
                 given = auth[7:].strip()
+            elif self.headers.get("X-Api-Key"):
+                given = self.headers["X-Api-Key"].strip()
             else:
                 given = (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
             return bool(given) and hmac.compare_digest(given, token)

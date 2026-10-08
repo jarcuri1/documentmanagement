@@ -90,6 +90,43 @@ class IngestTests(Base):
         ingest.ingest_payload(self.store, payload)
         self.assertEqual(len(self.store.workouts(2)), 2)
 
+    def test_health_connect_webhook_android(self):
+        import os
+        os.environ["HEALTH_TZ"] = "America/New_York"
+        try:
+            batch1 = {"timestamp": "2026-10-07T14:00:00.123Z", "app_version": "1.2.3", "steps": [
+                {"count": 3000, "start_time": "2026-10-07T13:00:00Z", "end_time": "2026-10-07T14:00:00Z",
+                 "metadata": {"data_origin": "com.google.android.apps.fitness"}},
+                # 01:30Z on the 8th is 21:30 on the 7th in New York -> counts for the 7th
+                {"count": 500, "start_time": "2026-10-08T01:30:00Z", "end_time": "2026-10-08T01:45:00Z",
+                 "metadata": {"data_origin": "com.google.android.apps.fitness"}},
+            ], "exercise": [
+                {"type": "STRENGTH_TRAINING", "title": "Upper Body Power", "duration_seconds": 2400,
+                 "start_time": "2026-10-07T11:00:00Z", "end_time": "2026-10-07T11:40:00Z",
+                 "metadata": {"data_origin": "com.tonal.trainer"}},
+                {"type": "WALKING", "start_time": "2026-10-07T20:00:00Z", "end_time": "2026-10-07T20:30:00Z"},
+            ]}
+            self.assertEqual(ingest.ingest_payload(self.store, batch1), {"step_days": 1, "workouts": 2})
+            # same batch re-sent + an incremental batch with a new chunk: no double count
+            ingest.ingest_payload(self.store, batch1)
+            ingest.ingest_payload(self.store, {"app_version": "1.2.3", "steps": [
+                {"count": 1000, "start_time": "2026-10-07T15:00:00Z", "end_time": "2026-10-07T16:00:00Z",
+                 "metadata": {"data_origin": "com.google.android.apps.fitness"}}]})
+        finally:
+            del os.environ["HEALTH_TZ"]
+        with self.store._db() as db:
+            rows = [dict(r) for r in db.execute("SELECT * FROM steps")]
+        self.assertEqual(rows, [{"day": "2026-10-07", "source": "com.google.android.apps.fitness",
+                                 "count": 4500}])
+        with self.store._db() as db:
+            ws = {r["title"]: dict(r) for r in db.execute("SELECT * FROM workouts")}
+        self.assertEqual(len(ws), 2)
+        self.assertEqual(ws["Upper Body Power"]["source"], "tonal")
+        self.assertEqual(ws["Upper Body Power"]["started_at"], "2026-10-07T07:00:00")
+        self.assertEqual(ws["Upper Body Power"]["duration_min"], 40)
+        self.assertEqual((ws["Walking"]["source"], ws["Walking"]["duration_min"]),
+                         ("health_connect", 30))
+
     def test_simple_shapes(self):
         ingest.ingest_payload(self.store, {"date": TODAY, "steps": 4321, "source": "android"})
         ingest.ingest_payload(self.store, [{"date": YESTERDAY, "steps": "1200"}, {"bad": 1}])
@@ -131,9 +168,10 @@ class ServerTests(Base):
         self.srv.server_close()
         super().tearDown()
 
-    def _post(self, body, token=None, path="/ingest"):
+    def _post(self, body, token=None, path="/ingest", headers=None):
+        hdrs = headers or ({"Authorization": f"Bearer {token}"} if token else {})
         req = urllib.request.Request(self.url + path, data=json.dumps(body).encode(), method="POST",
-                                     headers={"Authorization": f"Bearer {token}"} if token else {})
+                                     headers=hdrs)
         try:
             with urllib.request.urlopen(req) as r:
                 return r.status, json.loads(r.read())
@@ -148,6 +186,9 @@ class ServerTests(Base):
         code, _ = self._post({"date": TODAY, "steps": 6000}, path=f"/ingest?token={self.token}")
         self.assertEqual(code, 200)
         self.assertEqual(self.store.daily_steps(1)[0]["steps"], 6000)
+        code, _ = self._post({"date": TODAY, "steps": 7000}, headers={"X-Api-Key": self.token})
+        self.assertEqual(code, 200)
+        self.assertEqual(self._post({"date": TODAY, "steps": 1}, headers={"X-Api-Key": "nope"})[0], 401)
 
 
 # ----------------------------------------------------------------------

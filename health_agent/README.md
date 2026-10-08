@@ -5,8 +5,8 @@ phone's step count, your medical history, and your current aches and pains,
 and builds its suggestions around all of them.
 
 ```
- iPhone / Android ──(Health Auto Export / Shortcut)──► ingest_server.py ─┐
- Tonal ──► Apple Health / Health Connect ──► (same phone feed) ──────────┤
+ Android: Health Connect ──(HC Webhook app)──────────► ingest_server.py ─┐
+ Tonal ──► Health Connect ──► (same phone feed) ─────────────────────────┤
  Tonal (experimental direct API) ──► tonal_client.py ────────────────────┤
  You: `health.py pain / add-history` or just tell the coach in chat ─────┤
                                                                          ▼
@@ -20,7 +20,7 @@ and builds its suggestions around all of them.
 |---|---|
 | `health.py` | CLI: setup, chat, brief, pain log, medical history, imports, status |
 | `health_store.py` | SQLite store: profile, medical, pain_log, steps, workouts |
-| `ingest.py` | Parsers: Health Auto Export JSON, simple `{date, steps}`, Apple `export.xml`, CSV |
+| `ingest.py` | Parsers: HC Webhook (Android Health Connect) JSON, Health Auto Export (iPhone) JSON, simple `{date, steps}`, Apple `export.xml`, CSV |
 | `ingest_server.py` | Token-protected `POST /ingest` your phone posts to |
 | `tonal_client.py` | Experimental direct pull of Tonal history (movements, volume, muscle groups) |
 | `coach.py` | Claude coach: reads the full record, saves pains/history you mention, writes the daily brief |
@@ -58,41 +58,59 @@ python health.py resolve-pain 3   # when it's gone
 Log the same spot again as it changes. The coach reads the trend (3 → 5 → 6
 means back off, 5 → 3 means step back up carefully).
 
-## 3. Phone steps (and Tonal workouts through the phone)
+## 3. Phone steps and Tonal workouts (Android)
 
-Neither Apple Health nor Android Health Connect has a cloud API, so the phone
-has to send its data out.
+Android keeps your steps and workouts in **Health Connect** (built into
+Android 14+, a Play Store app on older phones). Health Connect has no cloud
+API, so a small app on the phone reads it and posts it to the agent.
 
-**Start the receiver** on the PC:
+**a. Start the receiver** on the PC:
 ```
 set HEALTH_INGEST_TOKEN=<random 32+ chars>
-python ingest_server.py           # listens on :8765
+set HEALTH_TZ=America/New_York        # your time zone; steps are bucketed by YOUR day
+python ingest_server.py               # listens on :8765
 ```
-The phone has to reach the PC. Install **Tailscale** on both and use the PC's
-Tailscale IP. Don't port-forward this to the internet.
+The phone has to reach the PC. Install **Tailscale** on both (free) and use the
+PC's Tailscale IP. Don't port-forward this to the internet.
 
-**iPhone:** install *Health Auto Export – JSON+CSV* and add an Automation:
-- Type: **REST API**, URL `http://<pc-tailscale-ip>:8765/ingest`
-- Header `Authorization: Bearer <your token>`
-- Data: Health Metrics → **Step Count**, plus **Workouts**
-- Aggregation: Day. Format: JSON. Sync cadence: hourly.
+**b. Tonal → Health Connect:** in the Tonal app, turn on the **Health Connect**
+integration and allow it to write exercise. Every Tonal session then lands in
+Health Connect.
 
-**Tonal:** in the Tonal app, turn on **Apple Health** (or Health Connect). Every
-Tonal session then comes through the same feed, tagged `tonal`. This is the
-dependable Tonal route.
+**c. Steps → Health Connect:** make sure whatever counts your steps (Google Fit,
+Samsung Health, Fitbit, your watch app) is allowed to write **Steps** to Health
+Connect. Check under *Settings → Health Connect → App permissions*.
 
-**Android / no app:** any automation (Tasker, iOS Shortcuts) can post
+**d. Health Connect → the agent:** install **HC Webhook**
+([github.com/mcnaveen/health-connect-webhook](https://github.com/mcnaveen/health-connect-webhook),
+on Google Play). It's open source, which matters because it handles health data.
+- Grant it read access to **Steps** and **Exercise**. That's all the agent uses.
+- Webhook URL: `http://<pc-tailscale-ip>:8765/ingest`
+- Custom header: `X-Api-Key: <your HEALTH_INGEST_TOKEN>`
+- Sync interval: 15–60 minutes.
+- Use its manual **Sync** button once, then check with `python health.py status`.
+
+Re-sent and overlapping batches are de-duplicated chunk by chunk, so syncing
+often never inflates your steps. If both your phone and watch report steps, the
+agent uses the higher number for the day, not the sum. Workouts written by
+Tonal are tagged `tonal`. Other exercise (walks, rides) is kept too.
+
+**No app?** Any automation (Tasker, etc.) can post
 `{"date": "2026-10-07", "steps": 8123, "source": "android"}` to the same URL.
 
-**Backfill history** once from a full Apple Health export:
-```
-python health.py import-apple export.xml --since 2026-01-01
-python health.py import-steps steps.csv     # date,steps[,source]
-```
+**Backfill:** `python health.py import-steps steps.csv` (columns `date,steps`).
+
+<details><summary>iPhone instead</summary>
+
+Use *Health Auto Export – JSON+CSV* → Automation → REST API to the same URL with
+header `Authorization: Bearer <token>`, metrics Step Count + Workouts, daily
+aggregation. Turn on Apple Health in the Tonal app. Backfill with
+`python health.py import-apple export.xml`.
+</details>
 
 ## 4. Tonal detail (optional, experimental)
 
-The phone route gives date, duration, and calories. For per-movement weights,
+The Health Connect route gives the date, duration, and Tonal's workout title. For per-movement weights,
 volume, and muscle groups, `tonal_client.py` can log in to Tonal's own backend.
 **Tonal has no public API.** This route uses undocumented endpoints that can
 change without notice, and it may be against Tonal's terms. Every endpoint is

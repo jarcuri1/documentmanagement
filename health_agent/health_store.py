@@ -14,7 +14,10 @@ Tables
                    set it off. Open until you mark it resolved.
   steps            one row per day per source (phone, watch, ...). The
                    day's number is the MAX across sources, never the sum —
-                   iPhone + Watch both count the same walk.
+                   phone + watch both count the same walk.
+  step_intervals   raw step chunks from Android Health Connect, keyed by
+                   (origin, start, end) so a re-sent or overlapping batch
+                   never double-counts; day totals are rebuilt from them.
   workouts         Tonal and anything else (walks, runs, rides): when, how
                    long, volume, muscle groups.
 
@@ -82,6 +85,14 @@ CREATE TABLE IF NOT EXISTS workouts (
     calories      REAL DEFAULT 0,
     muscle_groups TEXT DEFAULT '[]',
     details       TEXT DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS step_intervals (
+    origin     TEXT NOT NULL,
+    start_time TEXT NOT NULL,
+    end_time   TEXT NOT NULL,
+    day        TEXT NOT NULL,
+    count      INTEGER NOT NULL,
+    PRIMARY KEY (origin, start_time, end_time)
 );
 """
 
@@ -201,6 +212,25 @@ class HealthStore:
             db.execute("INSERT INTO steps(day, source, count) VALUES(?, ?, ?) "
                        "ON CONFLICT(day, source) DO UPDATE SET count=excluded.count",
                        (day[:10], source, int(count)))
+
+    def add_step_intervals(self, intervals):
+        """intervals: iterable of (origin, start_iso, end_iso, local_day, count).
+        Idempotent; then rebuilds `steps` for every (day, origin) touched."""
+        touched = set()
+        with self._db() as db:
+            for origin, start, end, day, count in intervals:
+                db.execute("INSERT INTO step_intervals VALUES(?, ?, ?, ?, ?) "
+                           "ON CONFLICT(origin, start_time, end_time) DO UPDATE SET "
+                           "count=excluded.count, day=excluded.day",
+                           (origin, start, end, day, int(count)))
+                touched.add((day, origin))
+            for day, origin in touched:
+                total = db.execute("SELECT COALESCE(SUM(count), 0) FROM step_intervals "
+                                   "WHERE day=? AND origin=?", (day, origin)).fetchone()[0]
+                db.execute("INSERT INTO steps(day, source, count) VALUES(?, ?, ?) "
+                           "ON CONFLICT(day, source) DO UPDATE SET count=excluded.count",
+                           (day, origin, total))
+        return len({d for d, _ in touched})
 
     def daily_steps(self, days=14):
         since = (date.today() - timedelta(days=days - 1)).isoformat()

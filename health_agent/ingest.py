@@ -9,6 +9,12 @@ has to PUSH its data out. Every supported path lands here:
                         "workouts": [...]}}
      Tonal writes every session to Apple Health, so Tonal workouts arrive on
      this same feed (tagged source "tonal").
+  1b. ANDROID: HC Webhook app (reads Health Connect) -> ingest_server.
+     Payload: {"timestamp", "app_version", "steps": [{count, start_time,
+     end_time, metadata: {data_origin}}], "exercise": [{type, title,
+     start_time, end_time, duration_seconds, ...}]}. Times are UTC; steps are
+     bucketed into YOUR local day (HEALTH_TZ, default this machine's zone).
+     Tonal writes its sessions to Health Connect, so they arrive here too.
   2. iOS Shortcut / Android Tasker / anything -> ingest_server with the simple
      shape {"date": "2026-10-07", "steps": 8123, "source": "android"}
      (or a list of those).
@@ -23,9 +29,10 @@ is skipped, and the return value says how much landed.
 import csv
 import hashlib
 import json
+import os
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 STEP_METRIC_NAMES = {"step_count", "steps", "stepcount"}
 APPLE_STEP_TYPE = "HKQuantityTypeIdentifierStepCount"
@@ -85,6 +92,10 @@ def ingest_payload(store, payload):
         return _ingest_simple(store, payload)
     if isinstance(payload, dict) and "steps" in payload and "date" in payload:
         return _ingest_simple(store, [payload])
+    if isinstance(payload, dict) and ("app_version" in payload or
+                                      isinstance(payload.get("steps"), list) or
+                                      isinstance(payload.get("exercise"), list)):
+        return _ingest_health_connect(store, payload)
     data = payload.get("data", payload) if isinstance(payload, dict) else {}
     return _ingest_auto_export(store, data)
 
@@ -132,6 +143,66 @@ def _ingest_auto_export(store, data):
         )
         n_workouts += 1
     return {"step_days": _add_steps(store, per), "workouts": n_workouts}
+
+
+def _local_tz():
+    name = os.environ.get("HEALTH_TZ")
+    if name:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    return None  # astimezone(None) = this machine's local zone
+
+
+def _utc_to_local(value):
+    dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_local_tz())
+
+
+def _origin(rec):
+    meta = rec.get("metadata") or {}
+    return str(meta.get("data_origin") or "health_connect") if isinstance(meta, dict) \
+        else "health_connect"
+
+
+def _ingest_health_connect(store, data):
+    intervals = []
+    for r in data.get("steps") or []:
+        try:
+            start = _utc_to_local(r["start_time"])
+            intervals.append((_origin(r), str(r["start_time"]), str(r.get("end_time") or ""),
+                              start.date().isoformat(), int(_qty(r.get("count")))))
+        except (KeyError, ValueError, TypeError):
+            continue
+    step_days = store.add_step_intervals(intervals)
+
+    n_workouts = 0
+    for w in data.get("exercise") or []:
+        try:
+            start = _utc_to_local(w["start_time"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        origin = _origin(w)
+        kind = str(w.get("type") or "exercise")
+        title = w.get("title") or kind.replace("_", " ").title()
+        seconds = _qty(w.get("duration_seconds"))
+        if not seconds and w.get("end_time"):
+            try:
+                seconds = (_utc_to_local(w["end_time"]) - start).total_seconds()
+            except ValueError:
+                pass
+        store.upsert_workout(
+            ext_id=_workout_id("hc", w["start_time"], kind, origin),
+            source="tonal" if _looks_tonal(origin, title) else "health_connect",
+            started_at=start.strftime("%Y-%m-%dT%H:%M:%S"),
+            title=title,
+            duration_min=round(seconds / 60, 1),
+            details={k: w[k] for k in ("type", "distance_meters", "steps") if k in w}
+                    | {"origin": origin},
+        )
+        n_workouts += 1
+    return {"step_days": step_days, "workouts": n_workouts}
 
 
 # ----------------------------------------------------------------------
