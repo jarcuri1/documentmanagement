@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, urlparse
 
 from health_store import HealthStore
 from ingest import ingest_payload
+from vault import VaultError
 
 MAX_BODY = 50 * 1024 * 1024  # a month of unaggregated samples fits easily
 
@@ -100,7 +101,11 @@ def main():
     if len(token) < 16:
         sys.exit("Set HEALTH_INGEST_TOKEN to a random string of 16+ characters first.")
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(HealthStore(), token))
+    try:
+        store = HealthStore()
+    except VaultError as e:
+        sys.exit(f"Health record: {e}")
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(store, token))
     print(f"Health ingest listening on http://{args.host}:{args.port}/ingest")
     try:
         server.serve_forever()

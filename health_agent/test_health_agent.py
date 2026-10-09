@@ -3,6 +3,8 @@ tool loop against a fake Claude client. Run:  python -m pytest -q  (or
 python test_health_agent.py)."""
 
 import json
+import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -12,10 +14,15 @@ from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
-import coach
-import ingest
-from health_store import HealthStore
-from ingest_server import ThreadingHTTPServer, make_handler
+import vault
+
+# Tests use a throwaway key via the env override, never the real keyring.
+os.environ["HEALTH_KEY"] = vault.format_recovery_key(vault.new_key())
+
+import coach  # noqa: E402
+import ingest  # noqa: E402
+from health_store import HealthStore  # noqa: E402
+from ingest_server import ThreadingHTTPServer, make_handler  # noqa: E402
 
 TODAY = date.today().isoformat()
 YESTERDAY = (date.today() - timedelta(days=1)).isoformat()
@@ -191,6 +198,67 @@ class ServerTests(Base):
         self.assertEqual(self._post({"date": TODAY, "steps": 1}, headers={"X-Api-Key": "nope"})[0], 401)
 
 
+class VaultTests(Base):
+    def test_nothing_readable_on_disk(self):
+        self.store.add_medical("condition", "Hypertension", "diagnosed 2021")
+        self.store.log_pain("knee", 5, notes="sharp on stairs")
+        self.store.add_note("visit", "S: knee pain on stairs")
+        raw = (self.dir / "h.db").read_bytes()
+        self.assertTrue(raw.startswith(vault.MAGIC))
+        for secret in (b"Hypertension", b"knee", b"stairs", b"SQLite format"):
+            self.assertNotIn(secret, raw)
+        # a second store instance (another process) reads it back
+        self.assertEqual(HealthStore(self.dir / "h.db").medical()[0]["name"], "Hypertension")
+
+    def test_wrong_key_and_tampering_are_refused(self):
+        self.store.log_pain("knee", 2)
+        with self.assertRaises(vault.VaultError):
+            HealthStore(self.dir / "h.db", key=vault.new_key()).open_pains()
+        f = self.dir / "h.db"
+        blob = bytearray(f.read_bytes())
+        blob[-5] ^= 0xFF
+        f.write_bytes(bytes(blob))
+        with self.assertRaises(vault.VaultError):
+            self.store.open_pains()
+
+    def test_previous_version_kept_as_backup(self):
+        self.store.log_pain("knee", 2)
+        self.store.log_pain("hip", 3)
+        self.assertTrue((self.dir / "h.db.bak").exists())
+        self.assertFalse((self.dir / "h.db.lock").exists())
+
+    def test_concurrent_writers_lose_nothing(self):
+        def worker(i):
+            for j in range(10):
+                self.store.upsert_steps(f"2026-01-{i + 1:02d}", j, source=f"s{j}")
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        with self.store._db() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM steps").fetchone()[0], 50)
+
+    def test_recovery_key_round_trip(self):
+        k = vault.new_key()
+        text = vault.format_recovery_key(k)
+        self.assertEqual(vault.parse_recovery_key(text.lower().replace("-", " ")), k)
+        with self.assertRaises(vault.VaultError):
+            vault.parse_recovery_key("ABCD-EFGH")
+
+    def test_migrate_plaintext(self):
+        old = self.dir / "old.db"
+        db = sqlite3.connect(old)
+        db.execute("CREATE TABLE profile (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        db.execute("INSERT INTO profile VALUES('goals', 'deadlift 405')")
+        db.commit()
+        db.close()
+        target = self.dir / "migrated.enc"
+        vault.import_plaintext(vault.EncryptedDB(target), old)
+        self.assertEqual(HealthStore(target).profile(), {"goals": "deadlift 405"})
+        self.assertNotIn(b"deadlift", target.read_bytes())
+
+
 # ----------------------------------------------------------------------
 # Coach tool loop against a fake client
 # ----------------------------------------------------------------------
@@ -248,6 +316,38 @@ class CoachTests(Base):
         s.ask("one more")
         self.assertEqual(fake.requests[3]["messages"][-1]["content"], "one more")
 
+    def test_visit_is_saved_encrypted_and_noted(self):
+        fake = FakeClient([
+            SimpleNamespace(stop_reason="end_turn", content=[_block(type="text", text="Tell me more.")]),
+            SimpleNamespace(stop_reason="end_turn", content=[_block(type="text", text="S: hip ache\nA: ...")]),
+        ])
+        s = coach.CoachSession(self.store, client=fake)
+        s.ask("my hip aches")
+        self.assertIsNone(coach.CoachSession(self.store, client=fake).close())  # nothing said
+        self.assertEqual(s.close(), "S: hip ache\nA: ...")
+        conv = self.store.conversations()[0]
+        self.assertEqual([t["role"] for t in conv["transcript"]], ["you", "coach"])
+        self.assertIn("my hip aches", fake.requests[1]["messages"][0]["content"])
+        self.assertNotIn("tools", fake.requests[1])
+        # the note shows up in the record the next visit reads
+        self.assertEqual(self.store.snapshot()["recent_visit_notes"][0]["text"], "S: hip ache\nA: ...")
+
+    def test_identifiers_never_sent(self):
+        self.store.set_profile("name", "Jay Example")
+        self.store.set_profile("email", "jay@example.com")
+        self.store.set_profile("birth_year", "1980")
+        self.store.set_profile("goals", "stronger back")
+        block = coach.record_block(self.store)
+        for leak in ("Jay Example", "jay@example.com", "1980"):
+            self.assertNotIn(leak, block)
+        self.assertIn('"age": %d' % (date.today().year - 1980), block)
+        self.assertIn("stronger back", block)
+
+    def test_prompt_is_clinical_and_international(self):
+        for phrase in ("differentials", "must-not-miss", "No single", "Never invent citations",
+                       "traditional and complementary"):
+            self.assertIn(phrase, coach.SYSTEM_PROMPT)
+
     def test_tool_error_is_reported_not_raised(self):
         fake = FakeClient([
             SimpleNamespace(stop_reason="tool_use", content=[
@@ -263,13 +363,15 @@ class CoachTests(Base):
                                            content=[_block(type="text", text="Rest day.")])])
         self.assertEqual(coach.daily_brief(self.store, client=fake), "Rest day.")
         self.assertNotIn("tools", fake.requests[0])
-        import os
+        self.assertEqual(self.store.notes("brief")[-1]["text"], "Rest day.")
         os.environ["HEALTH_PUSH_OUTBOX"] = str(self.dir / "push_outbox")
         try:
-            self.assertTrue(coach.push_to_phone("t", "b"))
+            self.assertTrue(coach.push_to_phone("t", "knee 6/10, skip squats"))
         finally:
             del os.environ["HEALTH_PUSH_OUTBOX"]
-        self.assertEqual(len(list((self.dir / "push_outbox").glob("health-*.json"))), 1)
+        pushed = list((self.dir / "push_outbox").glob("health-*.json"))
+        self.assertEqual(len(pushed), 1)
+        self.assertNotIn("knee", pushed[0].read_text())  # no health detail by default
 
 
 if __name__ == "__main__":

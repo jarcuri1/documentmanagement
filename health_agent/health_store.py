@@ -20,17 +20,21 @@ Tables
                    never double-counts; day totals are rebuilt from them.
   workouts         Tonal and anything else (walks, runs, rides): when, how
                    long, volume, muscle groups.
+  conversations    full transcripts of your chats with the coach
+  notes            the coach's visit notes (one per chat) and daily briefs —
+                   the long-term memory that carries across years
 
-The DB holds medical information. It lives OUTSIDE the repo by default
-(HEALTH_DATA_DIR) and the folder is git-ignored in case it is pointed inside.
+The whole database is ENCRYPTED at rest (see vault.py). It is only ever
+decrypted in memory. The file lives in HEALTH_DATA_DIR, which is git-ignored.
 """
 
 import json
 import os
-import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
+
+from vault import EncryptedDB
 
 DEFAULT_DATA_DIR = Path(os.environ.get(
     "HEALTH_DATA_DIR", str(Path(__file__).with_name("data"))))
@@ -86,6 +90,18 @@ CREATE TABLE IF NOT EXISTS workouts (
     muscle_groups TEXT DEFAULT '[]',
     details       TEXT DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS conversations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    ended_at   TEXT,
+    transcript TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS notes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    text       TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS step_intervals (
     origin     TEXT NOT NULL,
     start_time TEXT NOT NULL,
@@ -101,22 +117,19 @@ def _now():
     return datetime.now().isoformat(timespec="seconds")
 
 
+STEP_INTERVAL_KEEP_DAYS = 120  # raw chunks only; daily totals are kept forever
+
+
 class HealthStore:
-    def __init__(self, path=None):
-        self.path = Path(path) if path else DEFAULT_DATA_DIR / "health.db"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._db() as db:
-            db.executescript(_SCHEMA)
+    def __init__(self, path=None, key=None):
+        self.path = Path(path) if path else DEFAULT_DATA_DIR / "health.db.enc"
+        self._vault = EncryptedDB(self.path, key)
 
     @contextmanager
     def _db(self):
-        db = sqlite3.connect(self.path)
-        db.row_factory = sqlite3.Row
-        try:
+        with self._vault.connect() as db:
+            db.executescript(_SCHEMA)
             yield db
-            db.commit()
-        finally:
-            db.close()
 
     # ------------------------------------------------------------------
     # Profile
@@ -224,6 +237,8 @@ class HealthStore:
                            "count=excluded.count, day=excluded.day",
                            (origin, start, end, day, int(count)))
                 touched.add((day, origin))
+            cutoff = (date.today() - timedelta(days=STEP_INTERVAL_KEEP_DAYS)).isoformat()
+            db.execute("DELETE FROM step_intervals WHERE day < ?", (cutoff,))
             for day, origin in touched:
                 total = db.execute("SELECT COALESCE(SUM(count), 0) FROM step_intervals "
                                    "WHERE day=? AND origin=?", (day, origin)).fetchone()[0]
@@ -270,6 +285,40 @@ class HealthStore:
         return rows
 
     # ------------------------------------------------------------------
+    # Conversations and notes (the long-term memory)
+    # ------------------------------------------------------------------
+    def start_conversation(self):
+        with self._db() as db:
+            return db.execute("INSERT INTO conversations(started_at) VALUES(?)",
+                              (_now(),)).lastrowid
+
+    def save_transcript(self, conv_id, turns):
+        with self._db() as db:
+            db.execute("UPDATE conversations SET transcript=?, ended_at=? WHERE id=?",
+                       (json.dumps(turns), _now(), conv_id))
+
+    def conversations(self, limit=20):
+        with self._db() as db:
+            rows = [dict(r) for r in db.execute(
+                "SELECT * FROM conversations ORDER BY id DESC LIMIT ?", (limit,))]
+        for r in rows:
+            r["transcript"] = json.loads(r["transcript"] or "[]")
+        return rows
+
+    def add_note(self, kind, text):
+        with self._db() as db:
+            return db.execute("INSERT INTO notes(created_at, kind, text) VALUES(?, ?, ?)",
+                              (_now(), kind, text)).lastrowid
+
+    def notes(self, kind=None, limit=12):
+        q, args = "SELECT * FROM notes", []
+        if kind:
+            q, args = q + " WHERE kind=?", [kind]
+        with self._db() as db:
+            rows = [dict(r) for r in db.execute(q + " ORDER BY id DESC LIMIT ?", args + [limit])]
+        return list(reversed(rows))
+
+    # ------------------------------------------------------------------
     # Snapshot — everything the coach needs, in one dict
     # ------------------------------------------------------------------
     def snapshot(self, days=14):
@@ -279,6 +328,8 @@ class HealthStore:
             "today": date.today().isoformat(),
             "profile": self.profile(),
             "medical": self.medical(),
+            "past_medical": [m for m in self.medical(include_inactive=True) if not m["active"]],
+            "recent_visit_notes": self.notes("visit", limit=12),
             "open_pains": self.open_pains(),
             "pain_history_30d": self.pain_history(30),
             "steps": {

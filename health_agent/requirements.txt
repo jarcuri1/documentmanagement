@@ -1,1 +1,3 @@
 anthropic>=1.12
+cryptography>=42
+keyring>=25

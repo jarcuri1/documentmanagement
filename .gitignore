@@ -17,3 +17,6 @@ multi_family_lease.pdf
 # Health agent data — medical history, pains, steps. NEVER commit.
 health_agent/data/
 *.db
+*.enc
+*.enc.bak
+*.enc.lock
